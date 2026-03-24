@@ -3,7 +3,7 @@
 
 Usage:
     # Full training run (JiT-B, 4 GPUs):
-    python train.py configs/jit_b_4gpu.yaml
+    torchrun --standalone --nproc_per_node=4 train.py configs/jit_b_4gpu.yaml
 
     # Debug run:
     python train.py configs/debug.yaml
@@ -11,8 +11,15 @@ Usage:
     # Override individual config values at the command line:
     python train.py configs/jit_b_4gpu.yaml --override training.batch_size=64 data.path=/my/data
 
-    # Resume from a checkpoint directory:
-    python train.py configs/jit_b_4gpu.yaml --override logging.resume=./output/jit_b_4gpu/last.ckpt
+    # Explicit resume (auto-resume from last.ckpt in output_dir is on by default):
+    python train.py configs/jit_b_4gpu.yaml --override logging.resume=./output/jit_b_4gpu/step-00050000.ckpt
+
+SLURM / auto-requeue
+--------------------
+When running under SLURM, Lightning automatically requeueing the job when it
+receives a preemption signal (SIGUSR1).  The last checkpoint written by
+ModelCheckpoint is picked up on the next run via the auto-resume logic below,
+so no manual intervention is needed after a job is killed or preempted.
 """
 import argparse
 import os
@@ -22,6 +29,7 @@ import pytorch_lightning as pl
 from omegaconf import OmegaConf
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 from pytorch_lightning.loggers import WandbLogger
+from pytorch_lightning.plugins.environments import SLURMEnvironment
 
 from callbacks import VisualizationCallback
 from data_module import ImageNetDataModule
@@ -71,19 +79,41 @@ def main() -> None:
         log_model=False,
     )
 
+    # ------------------------------------------------------------------
+    # Callbacks
+    # ------------------------------------------------------------------
     callbacks = [
         LearningRateMonitor(logging_interval="step"),
         VisualizationCallback(cfg),
+        # Epoch-based checkpoint + last.ckpt (used for auto-resume)
         ModelCheckpoint(
             dirpath=cfg.logging.output_dir,
             filename="checkpoint-{epoch:04d}",
             every_n_epochs=cfg.logging.save_freq,
             save_last=True,
-            save_top_k=-1,   # keep all periodic checkpoints
+            save_top_k=-1,
         ),
     ]
 
-    # Resolve resume path: accept either a .ckpt file or a directory
+    # Optional step-based checkpoint (disabled when save_every_n_steps == 0)
+    save_steps = cfg.logging.get("save_every_n_steps", 0)
+    if save_steps > 0:
+        callbacks.append(
+            ModelCheckpoint(
+                dirpath=cfg.logging.output_dir,
+                filename="step-{step:08d}",
+                every_n_train_steps=save_steps,
+                save_top_k=-1,
+            )
+        )
+
+    # ------------------------------------------------------------------
+    # Resume logic
+    #   1. Explicit path in cfg.logging.resume  → use it (existing behaviour)
+    #   2. No explicit path                     → auto-detect last.ckpt in
+    #                                             output_dir (set by a previous
+    #                                             run or SLURM requeue)
+    # ------------------------------------------------------------------
     resume_path: str | None = cfg.logging.get("resume") or None
     if resume_path:
         if os.path.isdir(resume_path):
@@ -92,6 +122,11 @@ def main() -> None:
         elif not os.path.isfile(resume_path):
             print(f"Warning: resume path '{resume_path}' not found, training from scratch.")
             resume_path = None
+    else:
+        candidate = os.path.join(cfg.logging.output_dir, "last.ckpt")
+        if os.path.isfile(candidate):
+            resume_path = candidate
+            print(f"Auto-resuming from {resume_path}")
 
     trainer = pl.Trainer(
         max_epochs=cfg.training.epochs,
@@ -106,6 +141,7 @@ def main() -> None:
         default_root_dir=cfg.logging.output_dir,
         benchmark=True,
         enable_progress_bar=True,
+        plugins=[SLURMEnvironment(auto_requeue=True)],
     )
 
     trainer.fit(module, datamodule=datamodule, ckpt_path=resume_path)

@@ -59,6 +59,7 @@ sampling:
 logging:
   output_dir: "./output/jit_b_4gpu"
   save_freq: 5
+  save_every_n_steps: 50000
   log_freq: 100
   resume: null
   wandb_project: "jitpp"

@@ -62,9 +62,10 @@ sampling:
 # --------------- Logging / checkpointing ---------------
 logging:
   output_dir: "./output/base"
-  save_freq: 5          # save a checkpoint every N epochs
-  log_freq: 100         # log scalars every N training steps
-  resume: null          # path to a .ckpt file or directory containing last.ckpt
+  save_freq: 5              # save a checkpoint every N epochs
+  save_every_n_steps: 50000 # save a checkpoint every N steps (0 = disabled)
+  log_freq: 100             # log scalars every N training steps
+  resume: null              # explicit resume path; if null, last.ckpt in output_dir is used automatically
   wandb_project: "jitpp"
   wandb_experiment: "base"
   wandb_offline: true   # set to false to sync runs to wandb.ai in real time
