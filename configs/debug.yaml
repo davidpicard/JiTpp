@@ -1,0 +1,71 @@
+# ============================================================
+# Debug configuration  —  1 GPU · 128 px · tiny batch
+#
+# Intended for rapid iteration and smoke-testing on a single
+# GPU without needing a full ImageNet setup.  Reduce epochs,
+# batch size, and image resolution so a forward/backward pass
+# completes in seconds.
+#
+# Note: 128 px has no pre-computed FID stats, so evaluate.py
+# will save generated images but skip FID/IS computation.
+#
+# Launch:
+#   python train.py configs/debug.yaml
+# ============================================================
+
+hardware:
+  num_nodes: 1
+  gpus_per_node: 1
+  precision: "bf16-mixed"
+  num_workers: 2
+  pin_memory: true
+
+model:
+  arch: "JiT-B/16"
+  img_size: 128         # 128/16 = 8 patches per side; much faster than 256
+  attn_dropout: 0.0
+  proj_dropout: 0.0
+
+data:
+  path: "./data/imagenet"
+  num_classes: 1000
+
+training:
+  epochs: 10
+  batch_size: 32
+  blr: 8.0e-4
+  min_lr: 0.0
+  lr_schedule: "constant"
+  warmup_epochs: 0
+  weight_decay: 0.0
+  seed: 42
+
+diffusion:
+  P_mean: -0.8
+  P_std: 0.8
+  noise_scale: 1.0
+  t_eps: 0.05
+  label_drop_prob: 0.1
+  ema_decay1: 0.9999
+  ema_decay2: 0.9996
+
+sampling:
+  method: "euler"       # faster than heun for debugging
+  num_steps: 10         # fewer steps → faster generation
+  cfg: 1.0
+  interval_min: 0.0
+  interval_max: 1.0
+  num_images: 1000      # small generation run
+  gen_batch_size: 32
+
+logging:
+  output_dir: "./output/debug"
+  save_freq: 2
+  log_freq: 10
+  resume: null
+  wandb_project: "jitpp"
+  wandb_experiment: "debug"
+  wandb_offline: false
+  vis_every_n_steps: 1000
+  vis_cfg: 7.5
+  vis_sampling_steps: 10

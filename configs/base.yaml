@@ -1,0 +1,68 @@
+# ============================================================
+# JiT base configuration — all keys and their default values.
+# Copy this file and override only the fields you need.
+# ============================================================
+
+# --------------- Hardware / parallelism ---------------
+hardware:
+  num_nodes: 1          # number of machines
+  gpus_per_node: 8      # GPUs per machine
+  precision: "bf16-mixed"
+  num_workers: 12       # DataLoader worker processes per GPU
+  pin_memory: true
+
+# --------------- Model architecture ---------------
+model:
+  arch: "JiT-B/16"     # one of: JiT-B/16 JiT-B/32 JiT-L/16 JiT-L/32 JiT-H/16 JiT-H/32
+  img_size: 256         # input/output resolution in pixels (must be divisible by patch size)
+  attn_dropout: 0.0
+  proj_dropout: 0.0
+
+# --------------- Dataset ---------------
+data:
+  path: "./data/imagenet"   # root directory; expects a "train/" subfolder (ImageFolder layout)
+  num_classes: 1000
+
+# --------------- Training ---------------
+training:
+  epochs: 600
+  batch_size: 128       # per-GPU batch size; effective = batch_size * gpus_per_node * num_nodes
+  blr: 5.0e-5           # base LR; actual LR = blr * effective_batch / 256
+  min_lr: 0.0           # minimum LR for cosine schedule (ignored when lr_schedule=constant)
+  lr_schedule: "constant"  # "constant" or "cosine"
+  warmup_epochs: 5
+  weight_decay: 0.0
+  seed: 0
+
+# --------------- Diffusion / denoising ---------------
+diffusion:
+  P_mean: -0.8          # mean of the logit-normal timestep distribution
+  P_std: 0.8            # std  of the logit-normal timestep distribution
+  noise_scale: 1.0      # initial noise magnitude (use 2.0 for 512px)
+  t_eps: 0.05           # numerical stability clamp in velocity computation
+  label_drop_prob: 0.1  # fraction of labels dropped for classifier-free guidance
+  ema_decay1: 0.9999    # primary EMA (used for sampling by default)
+  ema_decay2: 0.9996    # secondary EMA
+
+# --------------- Sampling / evaluation ---------------
+sampling:
+  method: "heun"        # "euler" or "heun"
+  num_steps: 50         # ODE integration steps
+  cfg: 1.0              # classifier-free guidance scale
+  interval_min: 0.0     # apply CFG only when t > interval_min ...
+  interval_max: 1.0     # ... and t < interval_max
+  num_images: 50000     # images to generate for FID evaluation
+  gen_batch_size: 256   # batch size used during generation
+
+# --------------- Logging / checkpointing ---------------
+logging:
+  output_dir: "./output/base"
+  save_freq: 5          # save a checkpoint every N epochs
+  log_freq: 100         # log scalars every N training steps
+  resume: null          # path to a .ckpt file or directory containing last.ckpt
+  wandb_project: "jitpp"
+  wandb_experiment: "base"
+  wandb_offline: true   # set to false to sync runs to wandb.ai in real time
+  vis_every_n_steps: 25000  # generate sample grids every N training steps
+  vis_cfg: 2.5              # CFG scale used for the "with cfg" visualization panel
+  vis_sampling_steps: 20    # ODE steps for visualization (fewer = faster, lower quality)

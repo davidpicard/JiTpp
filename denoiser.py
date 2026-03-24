@@ -6,36 +6,52 @@ from model_jit import JiT_models
 class Denoiser(nn.Module):
     def __init__(
         self,
-        args
+        model_arch: str = 'JiT-B/16',
+        img_size: int = 256,
+        num_classes: int = 1000,
+        attn_dropout: float = 0.0,
+        proj_dropout: float = 0.0,
+        label_drop_prob: float = 0.1,
+        P_mean: float = -0.8,
+        P_std: float = 0.8,
+        t_eps: float = 5e-2,
+        noise_scale: float = 1.0,
+        ema_decay1: float = 0.9999,
+        ema_decay2: float = 0.9996,
+        sampling_method: str = 'heun',
+        num_sampling_steps: int = 50,
+        cfg_scale: float = 1.0,
+        interval_min: float = 0.0,
+        interval_max: float = 1.0,
     ):
         super().__init__()
-        self.net = JiT_models[args.model](
-            input_size=args.img_size,
+        self.net = JiT_models[model_arch](
+            input_size=img_size,
             in_channels=3,
-            num_classes=args.class_num,
-            attn_drop=args.attn_dropout,
-            proj_drop=args.proj_dropout,
+            num_classes=num_classes,
+            attn_drop=attn_dropout,
+            proj_drop=proj_dropout,
         )
-        self.img_size = args.img_size
-        self.num_classes = args.class_num
+        self.img_size = img_size
+        self.num_classes = num_classes
 
-        self.label_drop_prob = args.label_drop_prob
-        self.P_mean = args.P_mean
-        self.P_std = args.P_std
-        self.t_eps = args.t_eps
-        self.noise_scale = args.noise_scale
+        self.label_drop_prob = label_drop_prob
+        self.P_mean = P_mean
+        self.P_std = P_std
+        self.t_eps = t_eps
+        self.noise_scale = noise_scale
 
         # ema
-        self.ema_decay1 = args.ema_decay1
-        self.ema_decay2 = args.ema_decay2
+        self.ema_decay1 = ema_decay1
+        self.ema_decay2 = ema_decay2
         self.ema_params1 = None
         self.ema_params2 = None
 
         # generation hyper params
-        self.method = args.sampling_method
-        self.steps = args.num_sampling_steps
-        self.cfg_scale = args.cfg
-        self.cfg_interval = (args.interval_min, args.interval_max)
+        self.method = sampling_method
+        self.steps = num_sampling_steps
+        self.cfg_scale = cfg_scale
+        self.cfg_interval = (interval_min, interval_max)
 
     def drop_labels(self, labels):
         drop = torch.rand(labels.shape[0], device=labels.device) < self.label_drop_prob
