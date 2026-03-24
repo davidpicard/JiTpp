@@ -1,0 +1,75 @@
+# ============================================================
+# JiT-B/16 + PoM  —  1 node · 4 GPUs · 256 px
+#
+# Replaces self-attention with the Polynomial Mixer (ComPoM),
+# a linear-complexity alternative.  All other settings mirror
+# jit_b_4gpu.yaml.
+#
+# Effective batch size : 128 × 4 = 512
+# Actual LR            : 5e-5 × 512/256 = 1e-4
+#
+# Launch with torchrun (single node, 4 processes):
+#   torchrun --standalone --nproc_per_node=4 train.py configs/jit_b_pom_4gpu.yaml
+# ============================================================
+
+hardware:
+  num_nodes: 1
+  gpus_per_node: 4
+  precision: "bf16-mixed"
+  num_workers: 12
+  pin_memory: true
+
+model:
+  arch: "JiT-B/16"
+  img_size: 256
+  attn_dropout: 0.0
+  proj_dropout: 0.0
+  mixer: "pom"
+  pom_degree: 3
+  pom_expand: 1
+  pom_n_groups: 1
+  pom_n_sel_heads: 1
+
+data:
+  path: "./data/imagenet"
+  num_classes: 1000
+
+training:
+  epochs: 600
+  batch_size: 128
+  blr: 5.0e-5
+  min_lr: 0.0
+  lr_schedule: "constant"
+  warmup_epochs: 5
+  weight_decay: 0.0
+  seed: 0
+
+diffusion:
+  P_mean: -0.8
+  P_std: 0.8
+  noise_scale: 1.0
+  t_eps: 0.05
+  label_drop_prob: 0.1
+  ema_decay1: 0.9999
+  ema_decay2: 0.9996
+
+sampling:
+  method: "heun"
+  num_steps: 50
+  cfg: 1.0
+  interval_min: 0.0
+  interval_max: 1.0
+  num_images: 50000
+  gen_batch_size: 256
+
+logging:
+  output_dir: "./output/jit_b_pom_4gpu"
+  save_freq: 5
+  log_freq: 100
+  resume: null
+  wandb_project: "jitpp"
+  wandb_experiment: "jit-b-pom-4gpu"
+  wandb_offline: true
+  vis_every_n_steps: 25000
+  vis_cfg: 2.5
+  vis_sampling_steps: 20

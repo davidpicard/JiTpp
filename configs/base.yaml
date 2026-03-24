@@ -17,6 +17,11 @@ model:
   img_size: 256         # input/output resolution in pixels (must be divisible by patch size)
   attn_dropout: 0.0
   proj_dropout: 0.0
+  mixer: "attention"    # "attention" or "pom" (Polynomial Mixer, linear complexity)
+  pom_degree: 3         # polynomial degree (pom only)
+  pom_expand: 1         # channel expansion factor (pom only)
+  pom_n_groups: 1       # grouped-conv groups for po_proj (pom only; 1 = no grouping)
+  pom_n_sel_heads: 1    # selection heads; 1 = scalar gating, >1 = multi-head gating (pom only)
 
 # --------------- Dataset ---------------
 data:

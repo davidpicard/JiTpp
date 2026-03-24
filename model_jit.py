@@ -8,6 +8,7 @@ import torch.nn as nn
 import math
 import torch.nn.functional as F
 from util.model_util import VisionRotaryEmbeddingFast, get_2d_sincos_pos_embed, RMSNorm
+from compom import ComPoM
 
 
 def modulate(x, shift, scale):
@@ -94,7 +95,7 @@ class LabelEmbedder(nn.Module):
 def scaled_dot_product_attention(query, key, value, dropout_p=0.0) -> torch.Tensor:
     L, S = query.size(-2), key.size(-2)
     scale_factor = 1 / math.sqrt(query.size(-1))
-    attn_bias = torch.zeros(query.size(0), 1, L, S, dtype=query.dtype).cuda()
+    attn_bias = torch.zeros(query.size(0), 1, L, S, dtype=query.dtype, device=query.device)
 
     with torch.cuda.amp.autocast(enabled=False):
         attn_weight = query.float() @ key.float().transpose(-2, -1) * scale_factor
@@ -180,12 +181,41 @@ class FinalLayer(nn.Module):
         return x
 
 
+class ComPoMWrapper(nn.Module):
+    """Wraps ComPoM to match the Attention(x, rope) interface.
+
+    RoPE is applied to x by temporarily splitting it into the same
+    (B, num_heads, N, head_dim) layout used by Attention, so that
+    PoM receives positionally-encoded features identical to what
+    attention's Q and K see.
+    """
+    def __init__(self, dim, num_heads, degree=3, expand=1, n_groups=1, n_sel_heads=1):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.pom = ComPoM(dim=dim, degree=degree, expand=expand,
+                          n_groups=n_groups, n_sel_heads=n_sel_heads)
+
+    def forward(self, x, rope):
+        B, N, C = x.shape
+        x = x.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)  # (B, H, N, head_dim)
+        x = rope(x)
+        x = x.transpose(1, 2).reshape(B, N, C)
+        return self.pom(x)
+
+
 class JiTBlock(nn.Module):
-    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, attn_drop=0.0, proj_drop=0.0):
+    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, attn_drop=0.0, proj_drop=0.0,
+                 mixer="attention", pom_degree=3, pom_expand=1, pom_n_groups=1, pom_n_sel_heads=1):
         super().__init__()
         self.norm1 = RMSNorm(hidden_size, eps=1e-6)
-        self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, qk_norm=True,
-                              attn_drop=attn_drop, proj_drop=proj_drop)
+        if mixer == "pom":
+            self.attn = ComPoMWrapper(hidden_size, num_heads=num_heads, degree=pom_degree,
+                                      expand=pom_expand, n_groups=pom_n_groups,
+                                      n_sel_heads=pom_n_sel_heads)
+        else:
+            self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, qk_norm=True,
+                                  attn_drop=attn_drop, proj_drop=proj_drop)
         self.norm2 = RMSNorm(hidden_size, eps=1e-6)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
         self.mlp = SwiGLUFFN(hidden_size, mlp_hidden_dim, drop=proj_drop)
@@ -195,7 +225,7 @@ class JiTBlock(nn.Module):
         )
 
     @torch.compile
-    def forward(self, x,  c, feat_rope=None):
+    def forward(self, x, c, feat_rope=None):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=-1)
         x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa), rope=feat_rope)
         x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
@@ -220,7 +250,12 @@ class JiT(nn.Module):
         num_classes=1000,
         bottleneck_dim=128,
         in_context_len=32,
-        in_context_start=8
+        in_context_start=8,
+        mixer="attention",
+        pom_degree=3,
+        pom_expand=1,
+        pom_n_groups=1,
+        pom_n_sel_heads=1,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -267,7 +302,9 @@ class JiT(nn.Module):
         self.blocks = nn.ModuleList([
             JiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio,
                      attn_drop=attn_drop if (depth // 4 * 3 > i >= depth // 4) else 0.0,
-                     proj_drop=proj_drop if (depth // 4 * 3 > i >= depth // 4) else 0.0)
+                     proj_drop=proj_drop if (depth // 4 * 3 > i >= depth // 4) else 0.0,
+                     mixer=mixer, pom_degree=pom_degree, pom_expand=pom_expand,
+                     pom_n_groups=pom_n_groups, pom_n_sel_heads=pom_n_sel_heads)
             for i in range(depth)
         ])
 

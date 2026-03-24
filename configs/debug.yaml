@@ -22,9 +22,14 @@ hardware:
 
 model:
   arch: "JiT-B/16"
-  img_size: 128         # 128/16 = 8 patches per side; much faster than 256
+  img_size: 256         # 128/16 = 8 patches per side; much faster than 256
   attn_dropout: 0.0
   proj_dropout: 0.0
+  mixer: "pom"
+  pom_degree: 3
+  pom_expand: 2
+  pom_n_groups: 1
+  pom_n_sel_heads: 12
 
 data:
   path: "./data/imagenet"
@@ -32,7 +37,7 @@ data:
 
 training:
   epochs: 10
-  batch_size: 32
+  batch_size: 16
   blr: 8.0e-4
   min_lr: 0.0
   lr_schedule: "constant"

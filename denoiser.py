@@ -11,13 +11,16 @@ class Denoiser(nn.Module):
         num_classes: int = 1000,
         attn_dropout: float = 0.0,
         proj_dropout: float = 0.0,
+        mixer: str = 'attention',
+        pom_degree: int = 3,
+        pom_expand: int = 1,
+        pom_n_groups: int = 1,
+        pom_n_sel_heads: int = 1,
         label_drop_prob: float = 0.1,
         P_mean: float = -0.8,
         P_std: float = 0.8,
         t_eps: float = 5e-2,
         noise_scale: float = 1.0,
-        ema_decay1: float = 0.9999,
-        ema_decay2: float = 0.9996,
         sampling_method: str = 'heun',
         num_sampling_steps: int = 50,
         cfg_scale: float = 1.0,
@@ -31,6 +34,11 @@ class Denoiser(nn.Module):
             num_classes=num_classes,
             attn_drop=attn_dropout,
             proj_drop=proj_dropout,
+            mixer=mixer,
+            pom_degree=pom_degree,
+            pom_expand=pom_expand,
+            pom_n_groups=pom_n_groups,
+            pom_n_sel_heads=pom_n_sel_heads,
         )
         self.img_size = img_size
         self.num_classes = num_classes
@@ -40,12 +48,6 @@ class Denoiser(nn.Module):
         self.P_std = P_std
         self.t_eps = t_eps
         self.noise_scale = noise_scale
-
-        # ema
-        self.ema_decay1 = ema_decay1
-        self.ema_decay2 = ema_decay2
-        self.ema_params1 = None
-        self.ema_params2 = None
 
         # generation hyper params
         self.method = sampling_method
@@ -137,10 +139,3 @@ class Denoiser(nn.Module):
         z_next = z + (t_next - t) * v_pred
         return z_next
 
-    @torch.no_grad()
-    def update_ema(self):
-        source_params = list(self.parameters())
-        for targ, src in zip(self.ema_params1, source_params):
-            targ.detach().mul_(self.ema_decay1).add_(src, alpha=1 - self.ema_decay1)
-        for targ, src in zip(self.ema_params2, source_params):
-            targ.detach().mul_(self.ema_decay2).add_(src, alpha=1 - self.ema_decay2)
