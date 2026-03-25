@@ -53,9 +53,12 @@ class VisualizationCallback(pl.Callback):
         step = trainer.global_step
         if step == 0 or step % self.every_n_steps != 0:
             return
-        if not trainer.is_global_zero:
-            return
-        self._generate_and_log(trainer, pl_module)
+        if trainer.is_global_zero:
+            self._generate_and_log(trainer, pl_module)
+        # Barrier: ranks 1-N must not race ahead into the next training step
+        # while rank 0 is generating images. Without this they would block
+        # on the next gradient sync and hit the NCCL timeout (~30 min).
+        trainer.strategy.barrier()
 
     # ------------------------------------------------------------------
     # Core logic
