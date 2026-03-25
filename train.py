@@ -142,7 +142,10 @@ def main() -> None:
         default_root_dir=cfg.logging.output_dir,
         benchmark=True,
         enable_progress_bar=True,
-        plugins=[SLURMEnvironment(auto_requeue=True), AsyncCheckpointIO()],
+        plugins=[
+            *([ SLURMEnvironment(auto_requeue=True)] if "SLURM_JOB_ID" in os.environ else []),
+            AsyncCheckpointIO(),
+        ],
     )
 
     trainer.fit(module, datamodule=datamodule, ckpt_path=resume_path)
