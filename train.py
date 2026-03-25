@@ -30,6 +30,7 @@ from omegaconf import OmegaConf
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 from pytorch_lightning.loggers import WandbLogger
 from pytorch_lightning.plugins.environments import SLURMEnvironment
+from pytorch_lightning.plugins.io import AsyncCheckpointIO
 
 from callbacks import VisualizationCallback
 from data_module import ImageNetDataModule
@@ -90,7 +91,7 @@ def main() -> None:
             dirpath=cfg.logging.output_dir,
             filename="checkpoint-{epoch:04d}",
             every_n_epochs=cfg.logging.save_freq,
-            save_last=True,
+            save_last="link",
             save_top_k=-1,
         ),
     ]
@@ -141,7 +142,7 @@ def main() -> None:
         default_root_dir=cfg.logging.output_dir,
         benchmark=True,
         enable_progress_bar=True,
-        plugins=[SLURMEnvironment(auto_requeue=True)],
+        plugins=[SLURMEnvironment(auto_requeue=True), AsyncCheckpointIO()],
     )
 
     trainer.fit(module, datamodule=datamodule, ckpt_path=resume_path)

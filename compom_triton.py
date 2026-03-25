@@ -16,10 +16,12 @@ poly_agg_mean_triton(x, coeff, k) -> Tensor  (B, 1, D)
 """
 import torch
 
+import os
+
 try:
     import triton
     import triton.language as tl
-    TRITON_AVAILABLE = True
+    TRITON_AVAILABLE = not os.environ.get("POM_DISABLE_TRITON", "")
 except ImportError:
     TRITON_AVAILABLE = False
 
