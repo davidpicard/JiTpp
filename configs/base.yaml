@@ -62,8 +62,7 @@ sampling:
 # --------------- Logging / checkpointing ---------------
 logging:
   output_dir: "./output/base"
-  save_freq: 5              # save a checkpoint every N epochs
-  save_every_n_steps: 50000 # save a checkpoint every N steps (0 = disabled)
+  save_every_n_steps: 50000 # save a step checkpoint every N steps
   log_freq: 100             # log scalars every N training steps
   resume: null              # explicit resume path; if null, last.ckpt in output_dir is used automatically
   wandb_project: "jitpp"

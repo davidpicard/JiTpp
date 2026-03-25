@@ -86,27 +86,17 @@ def main() -> None:
     callbacks = [
         LearningRateMonitor(logging_interval="step"),
         VisualizationCallback(cfg),
-        # Epoch-based checkpoint + last.ckpt (used for auto-resume)
+        # Step-based checkpoint + last.ckpt symlink (used for auto-resume).
+        # save_every_n_steps=0 disables periodic saves but last.ckpt is still
+        # written at the end of training / on SLURM preemption.
         ModelCheckpoint(
             dirpath=cfg.logging.output_dir,
-            filename="checkpoint-{epoch:04d}",
-            every_n_epochs=cfg.logging.save_freq,
+            filename="step-{step:08d}",
+            every_n_train_steps=cfg.logging.save_every_n_steps or None,
             save_last="link",
-            save_top_k=-1,
+            save_top_k=-1 if cfg.logging.save_every_n_steps else 0,
         ),
     ]
-
-    # Optional step-based checkpoint (disabled when save_every_n_steps == 0)
-    save_steps = cfg.logging.get("save_every_n_steps", 0)
-    if save_steps > 0:
-        callbacks.append(
-            ModelCheckpoint(
-                dirpath=cfg.logging.output_dir,
-                filename="step-{step:08d}",
-                every_n_train_steps=save_steps,
-                save_top_k=-1,
-            )
-        )
 
     # ------------------------------------------------------------------
     # Resume logic
