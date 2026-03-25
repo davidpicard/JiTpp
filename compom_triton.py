@@ -9,19 +9,25 @@ PyTorch materialises a (B, N, D, K) intermediate before the mean.
 The kernels here fuse all three steps into a single pass over the
 input, eliminating the intermediate and halving memory bandwidth.
 
-Key optimisations vs a naïve port:
-  - coeff[d, k] is preloaded once per (b, d_blk) program and held in
-    registers for the entire N loop (main memory-placement change).
-  - X is a streaming tensor: each element is used once then discarded.
-    eviction_policy="evict_first" hints the cache not to pollute L2.
-  - cache_modifier=".ca" on coeff loads keeps them in L1 as a fallback
-    if register spill occurs under high-BLOCK_D / high-K configs.
-  - K is tl.constexpr so the inner polynomial loop is fully unrolled.
-  - num_stages is autotuned: higher values pipeline X loads behind
-    arithmetic, hiding global-memory latency.
-  - Grid uses a lambda so autotune's chosen BLOCK_D is respected.
-  - grad_x is accumulated in fp32 and cast to the input dtype in Python
-    (avoids an implicit fp32→bf16 store inside the kernel).
+Forward kernel optimisations
+-----------------------------
+- coeff[d, k] is preloaded once per (b, d_blk) program and held in
+  registers for the entire N loop.
+- X is streamed with eviction_policy="evict_first" to avoid polluting L2.
+- cache_modifier=".ca" on coeff loads provides an L1 fallback on spill.
+- K is tl.constexpr: the polynomial loop is fully unrolled.
+- Grid is a lambda so autotune's BLOCK_D is respected.
+
+Backward kernel optimisations
+-------------------------------
+- A single fused kernel computes both grad_x and grad_coeff in one pass
+  over X, so X is read only once (vs. twice with separate kernels).
+- go (upstream gradient) and coeff are preloaded into registers.
+- The hp accumulator is shared: the same power vector serves both the
+  grad_h computation (for grad_x) and the coeff accumulator.
+- grad_coeff is accumulated per-batch-element and written to the output
+  buffer via tl.atomic_add, avoiding a separate reduction pass.
+- grad_x is stored as fp32; cast to input dtype in Python wrapper.
 
 Exposed API
 -----------
@@ -39,11 +45,11 @@ except ImportError:
     TRITON_AVAILABLE = False
 
 
-# ---------------------------------------------------------------------------
-# Autotune config lists
-# ---------------------------------------------------------------------------
-
 if TRITON_AVAILABLE:
+
+    # ---------------------------------------------------------------------------
+    # Autotune configs
+    # ---------------------------------------------------------------------------
 
     _FWD_CONFIGS = [
         triton.Config({"BLOCK_D":  64}, num_warps=2, num_stages=3),
@@ -57,16 +63,17 @@ if TRITON_AVAILABLE:
         triton.Config({"BLOCK_D": 256}, num_warps=8, num_stages=3),
     ]
 
+    # Fused backward has more live registers (coeff + grad_coeff accumulators),
+    # so the tile family is shifted toward smaller BLOCK_D.
     _BWD_CONFIGS = [
+        triton.Config({"BLOCK_D":  32}, num_warps=2, num_stages=3),
+        triton.Config({"BLOCK_D":  32}, num_warps=4, num_stages=4),
         triton.Config({"BLOCK_D":  64}, num_warps=2, num_stages=3),
         triton.Config({"BLOCK_D":  64}, num_warps=4, num_stages=4),
         triton.Config({"BLOCK_D":  64}, num_warps=4, num_stages=6),
         triton.Config({"BLOCK_D": 128}, num_warps=4, num_stages=3),
         triton.Config({"BLOCK_D": 128}, num_warps=4, num_stages=4),
-        triton.Config({"BLOCK_D": 128}, num_warps=4, num_stages=6),
         triton.Config({"BLOCK_D": 128}, num_warps=8, num_stages=3),
-        triton.Config({"BLOCK_D": 256}, num_warps=4, num_stages=2),
-        triton.Config({"BLOCK_D": 256}, num_warps=8, num_stages=3),
     ]
 
     # ---------------------------------------------------------------------------
@@ -91,10 +98,7 @@ if TRITON_AVAILABLE:
         d_off = d_blk * BLOCK_D + tl.arange(0, BLOCK_D)
         dmask = d_off < D
 
-        # Preload coeff[d_off, 0..K-1] once per program.
-        # These BLOCK_D-wide vectors are held in registers for the entire N loop.
-        # cache_modifier=".ca" (cache-all) provides an L1 fallback if K is large
-        # enough to cause register spill; harmless otherwise.
+        # Preload coeff[d_off, 0..K-1] once per program; held in registers.
         c0  = tl.load(C_ptr + d_off * K + 0,  mask=dmask, other=0.0, cache_modifier=".ca") if K > 0  else 0.0
         c1  = tl.load(C_ptr + d_off * K + 1,  mask=dmask, other=0.0, cache_modifier=".ca") if K > 1  else 0.0
         c2  = tl.load(C_ptr + d_off * K + 2,  mask=dmask, other=0.0, cache_modifier=".ca") if K > 2  else 0.0
@@ -115,29 +119,24 @@ if TRITON_AVAILABLE:
         acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
 
         for n in range(N):
-            # X is streaming: each element is read once then never needed again.
-            # evict_first frees cache lines immediately, keeping L2 pressure low.
             x = tl.load(
                 X_ptr + b * stride_xb + n * stride_xn + d_off,
                 mask=dmask, other=0.0,
                 eviction_policy="evict_first",
             ).to(tl.float32)
 
-            # pom_activation: clamp(leaky_relu(x, 0.01), -0.1, 6)
             h = tl.where(x >= 0.0, x, x * 0.01)
             h = tl.maximum(h, -0.1)
             h = tl.minimum(h,  6.0)
 
-            # Polynomial weighted sum: Σ_k  coeff[d, k] * h^(k+1)
-            # K is constexpr so the compiler fully unrolls this.
             poly = tl.zeros((BLOCK_D,), dtype=tl.float32)
-            hp   = h                        # h^1
+            hp   = h
             if K > 0:
                 poly += c0 * hp
             if K > 1:
-                hp *= h; poly += c1 * hp    # h^2
+                hp *= h; poly += c1 * hp
             if K > 2:
-                hp *= h; poly += c2 * hp    # h^3
+                hp *= h; poly += c2 * hp
             if K > 3:
                 hp *= h; poly += c3 * hp
             if K > 4:
@@ -170,17 +169,30 @@ if TRITON_AVAILABLE:
         tl.store(O_ptr + b * D + d_off, acc / N, mask=dmask)
 
     # ---------------------------------------------------------------------------
-    # Backward kernel – grad w.r.t. X
+    # Fused backward kernel – grad_x and grad_coeff in one X pass
+    #
+    # Grid: (B, ceil(D/BLOCK_D))
+    #   Each program handles one batch element and one D tile.
+    #   After the N loop it atomic_adds its partial grad_coeff sums into GC,
+    #   reducing across B without a separate reduction kernel.
+    #
+    # Power sharing:
+    #   hp advances as h^0 → h^1 → ... → h^(K-1).
+    #   At step k:
+    #     grad_h update uses hp  (= h^k)           → coeff derivative
+    #     acc[k]  update uses hp * h (= h^(k+1))   → coeff gradient
+    #   The same hp * h product serves both, so no extra multiply.
     # ---------------------------------------------------------------------------
 
-    @triton.autotune(configs=_BWD_CONFIGS, key=["N", "D", "K"])
+    @triton.autotune(configs=_BWD_CONFIGS, key=["N", "D", "K"], reset_to_zero=["GC_ptr"])
     @triton.jit
-    def _poly_agg_mean_bwd_x(
-        GO_ptr,         # (B, D)    – upstream gradient (squeezed), fp32
-        X_ptr,          # (B, N, D) – saved input from forward
+    def _poly_agg_mean_bwd(
+        GO_ptr,         # (B, D)    – upstream gradient, fp32
+        X_ptr,          # (B, N, D) – saved input
         C_ptr,          # (D, K)    – polynomial coefficients, fp32
-        GX_ptr,         # (B, N, D) – output gradient, fp32
-        N, D,
+        GX_ptr,         # (B, N, D) – grad w.r.t. X, fp32
+        GC_ptr,         # (D, K)    – grad w.r.t. coeff, fp32 (zero-init, atomic)
+        B, N, D,
         stride_xb, stride_xn,
         K: tl.constexpr,
         BLOCK_D: tl.constexpr,
@@ -190,7 +202,7 @@ if TRITON_AVAILABLE:
         d_off = d_blk * BLOCK_D + tl.arange(0, BLOCK_D)
         dmask = d_off < D
 
-        # Preload upstream gradient and coeff – both reused across all N.
+        # --- Preload: constant over the N loop ---
         go    = tl.load(GO_ptr + b * D + d_off, mask=dmask, other=0.0).to(tl.float32)
         inv_N = 1.0 / N
 
@@ -211,6 +223,24 @@ if TRITON_AVAILABLE:
         c14 = tl.load(C_ptr + d_off * K + 14, mask=dmask, other=0.0, cache_modifier=".ca") if K > 14 else 0.0
         c15 = tl.load(C_ptr + d_off * K + 15, mask=dmask, other=0.0, cache_modifier=".ca") if K > 15 else 0.0
 
+        # --- grad_coeff accumulators (one per degree, reduced across N) ---
+        a0  = tl.zeros((BLOCK_D,), tl.float32)
+        a1  = tl.zeros((BLOCK_D,), tl.float32)
+        a2  = tl.zeros((BLOCK_D,), tl.float32)
+        a3  = tl.zeros((BLOCK_D,), tl.float32)
+        a4  = tl.zeros((BLOCK_D,), tl.float32)
+        a5  = tl.zeros((BLOCK_D,), tl.float32)
+        a6  = tl.zeros((BLOCK_D,), tl.float32)
+        a7  = tl.zeros((BLOCK_D,), tl.float32)
+        a8  = tl.zeros((BLOCK_D,), tl.float32)
+        a9  = tl.zeros((BLOCK_D,), tl.float32)
+        a10 = tl.zeros((BLOCK_D,), tl.float32)
+        a11 = tl.zeros((BLOCK_D,), tl.float32)
+        a12 = tl.zeros((BLOCK_D,), tl.float32)
+        a13 = tl.zeros((BLOCK_D,), tl.float32)
+        a14 = tl.zeros((BLOCK_D,), tl.float32)
+        a15 = tl.zeros((BLOCK_D,), tl.float32)
+
         for n in range(N):
             x = tl.load(
                 X_ptr + b * stride_xb + n * stride_xn + d_off,
@@ -218,61 +248,94 @@ if TRITON_AVAILABLE:
                 eviction_policy="evict_first",
             ).to(tl.float32)
 
-            # Recompute activation (same as forward)
             h = tl.where(x >= 0.0, x, x * 0.01)
             h = tl.maximum(h, -0.1)
             h = tl.minimum(h,  6.0)
 
-            # d(pom_activation)/dx
             d_act = tl.where(
                 (x >= 0.0) & (x <= 6.0), 1.0,
                 tl.where((x < 0.0) & (x >= -10.0), 0.01, 0.0),
             )
 
-            # d(poly)/dh = Σ_k  coeff[d,k] * (k+1) * h^k
-            grad_h = tl.zeros((BLOCK_D,), dtype=tl.float32)
-            hp     = tl.full((BLOCK_D,), 1.0, dtype=tl.float32)   # h^0
-            if K > 0:
-                grad_h += c0 * hp                   # 1 * c0 * h^0
-            if K > 1:
-                hp *= h; grad_h += c1 * 2.0 * hp    # 2 * c1 * h^1
-            if K > 2:
-                hp *= h; grad_h += c2 * 3.0 * hp
-            if K > 3:
-                hp *= h; grad_h += c3 * 4.0 * hp
-            if K > 4:
-                hp *= h; grad_h += c4 * 5.0 * hp
-            if K > 5:
-                hp *= h; grad_h += c5 * 6.0 * hp
-            if K > 6:
-                hp *= h; grad_h += c6 * 7.0 * hp
-            if K > 7:
-                hp *= h; grad_h += c7 * 8.0 * hp
-            if K > 8:
-                hp *= h; grad_h += c8 * 9.0 * hp
-            if K > 9:
-                hp *= h; grad_h += c9 * 10.0 * hp
-            if K > 10:
-                hp *= h; grad_h += c10 * 11.0 * hp
-            if K > 11:
-                hp *= h; grad_h += c11 * 12.0 * hp
-            if K > 12:
-                hp *= h; grad_h += c12 * 13.0 * hp
-            if K > 13:
-                hp *= h; grad_h += c13 * 14.0 * hp
-            if K > 14:
-                hp *= h; grad_h += c14 * 15.0 * hp
-            if K > 15:
-                hp *= h; grad_h += c15 * 16.0 * hp
+            # hp advances as h^0, h^1, ..., h^(K-1).
+            # At step k: grad_h uses hp (= h^k); a[k] uses hp*h (= h^(k+1)).
+            # hph = hp * h is computed once and serves both, then hp is advanced.
+            grad_h = tl.zeros((BLOCK_D,), tl.float32)
+            hp     = tl.full((BLOCK_D,), 1.0, tl.float32)   # h^0
 
-            grad_x = go * inv_N * grad_h * d_act
-            # GX_ptr is fp32 (allocated explicitly in the Python wrapper);
-            # no implicit dtype conversion at store time.
+            if K > 0:
+                hph = hp * h
+                grad_h += c0 * hp;   a0 += go * hph;   hp = hph
+            if K > 1:
+                hph = hp * h
+                grad_h += c1 * 2.0 * hp;   a1 += go * hph;   hp = hph
+            if K > 2:
+                hph = hp * h
+                grad_h += c2 * 3.0 * hp;   a2 += go * hph;   hp = hph
+            if K > 3:
+                hph = hp * h
+                grad_h += c3 * 4.0 * hp;   a3 += go * hph;   hp = hph
+            if K > 4:
+                hph = hp * h
+                grad_h += c4 * 5.0 * hp;   a4 += go * hph;   hp = hph
+            if K > 5:
+                hph = hp * h
+                grad_h += c5 * 6.0 * hp;   a5 += go * hph;   hp = hph
+            if K > 6:
+                hph = hp * h
+                grad_h += c6 * 7.0 * hp;   a6 += go * hph;   hp = hph
+            if K > 7:
+                hph = hp * h
+                grad_h += c7 * 8.0 * hp;   a7 += go * hph;   hp = hph
+            if K > 8:
+                hph = hp * h
+                grad_h += c8 * 9.0 * hp;   a8 += go * hph;   hp = hph
+            if K > 9:
+                hph = hp * h
+                grad_h += c9 * 10.0 * hp;  a9 += go * hph;   hp = hph
+            if K > 10:
+                hph = hp * h
+                grad_h += c10 * 11.0 * hp; a10 += go * hph;  hp = hph
+            if K > 11:
+                hph = hp * h
+                grad_h += c11 * 12.0 * hp; a11 += go * hph;  hp = hph
+            if K > 12:
+                hph = hp * h
+                grad_h += c12 * 13.0 * hp; a12 += go * hph;  hp = hph
+            if K > 13:
+                hph = hp * h
+                grad_h += c13 * 14.0 * hp; a13 += go * hph;  hp = hph
+            if K > 14:
+                hph = hp * h
+                grad_h += c14 * 15.0 * hp; a14 += go * hph;  hp = hph
+            if K > 15:
+                hph = hp * h
+                grad_h += c15 * 16.0 * hp; a15 += go * hph;  hp = hph
+
             tl.store(
                 GX_ptr + b * stride_xb + n * stride_xn + d_off,
-                grad_x,
+                go * inv_N * grad_h * d_act,
                 mask=dmask,
             )
+
+        # Atomic-add partial grad_coeff sums into GC (reduces across B).
+        # GC is zero-initialised by the Python wrapper before this kernel runs.
+        if K > 0:  tl.atomic_add(GC_ptr + d_off * K + 0,  a0  * inv_N, mask=dmask)
+        if K > 1:  tl.atomic_add(GC_ptr + d_off * K + 1,  a1  * inv_N, mask=dmask)
+        if K > 2:  tl.atomic_add(GC_ptr + d_off * K + 2,  a2  * inv_N, mask=dmask)
+        if K > 3:  tl.atomic_add(GC_ptr + d_off * K + 3,  a3  * inv_N, mask=dmask)
+        if K > 4:  tl.atomic_add(GC_ptr + d_off * K + 4,  a4  * inv_N, mask=dmask)
+        if K > 5:  tl.atomic_add(GC_ptr + d_off * K + 5,  a5  * inv_N, mask=dmask)
+        if K > 6:  tl.atomic_add(GC_ptr + d_off * K + 6,  a6  * inv_N, mask=dmask)
+        if K > 7:  tl.atomic_add(GC_ptr + d_off * K + 7,  a7  * inv_N, mask=dmask)
+        if K > 8:  tl.atomic_add(GC_ptr + d_off * K + 8,  a8  * inv_N, mask=dmask)
+        if K > 9:  tl.atomic_add(GC_ptr + d_off * K + 9,  a9  * inv_N, mask=dmask)
+        if K > 10: tl.atomic_add(GC_ptr + d_off * K + 10, a10 * inv_N, mask=dmask)
+        if K > 11: tl.atomic_add(GC_ptr + d_off * K + 11, a11 * inv_N, mask=dmask)
+        if K > 12: tl.atomic_add(GC_ptr + d_off * K + 12, a12 * inv_N, mask=dmask)
+        if K > 13: tl.atomic_add(GC_ptr + d_off * K + 13, a13 * inv_N, mask=dmask)
+        if K > 14: tl.atomic_add(GC_ptr + d_off * K + 14, a14 * inv_N, mask=dmask)
+        if K > 15: tl.atomic_add(GC_ptr + d_off * K + 15, a15 * inv_N, mask=dmask)
 
     # ---------------------------------------------------------------------------
     # autograd.Function wrapper
@@ -286,8 +349,6 @@ if TRITON_AVAILABLE:
             coeff_c = coeff.float().contiguous()
             out     = torch.empty(B, D, dtype=torch.float32, device=x.device)
 
-            # Grid lambda: lets autotune's chosen BLOCK_D determine the tile count.
-            # A hardcoded cdiv(D, 256) would produce a wrong grid for other configs.
             grid = lambda meta: (B, triton.cdiv(D, meta["BLOCK_D"]))
             _poly_agg_mean_fwd[grid](
                 x_c, coeff_c, out,
@@ -308,27 +369,18 @@ if TRITON_AVAILABLE:
 
             go = grad_out.squeeze(1).float().contiguous()   # (B, D)
 
-            # Allocate grad_x as fp32 so the Triton kernel stores without any
-            # implicit dtype conversion; we cast to x.dtype afterwards.
+            # fp32 buffers; cast grad_x to input dtype after the kernel.
             grad_x_buf = torch.empty(B, N, D, dtype=torch.float32, device=x.device)
+            # GC must be zero-initialised: the kernel accumulates via atomic_add.
+            grad_c = torch.zeros(D, k, dtype=torch.float32, device=x.device)
+
             grid = lambda meta: (B, triton.cdiv(D, meta["BLOCK_D"]))
-            _poly_agg_mean_bwd_x[grid](
-                go, x, coeff, grad_x_buf,
-                N, D,
+            _poly_agg_mean_bwd[grid](
+                go, x, coeff, grad_x_buf, grad_c,
+                B, N, D,
                 x.stride(0), x.stride(1),
                 K=k,
             )
-
-            # Gradient w.r.t. coeff – via PyTorch (sum over B and N)
-            # grad_coeff[d, k] = (1/N) Σ_{b,n}  h[b,n,d]^(k+1) * go[b,d]
-            from compom import pom_activation
-            h      = pom_activation(x.float())              # (B, N, D)
-            go_exp = go.unsqueeze(1)                         # (B, 1, D)
-            grad_c = torch.zeros_like(coeff)
-            hp     = h
-            for ki in range(k):
-                grad_c[:, ki] = (hp * go_exp / N).sum(dim=(0, 1))
-                hp = hp * h
 
             return grad_x_buf.to(x.dtype), grad_c.to(coeff.dtype), None
 
@@ -343,10 +395,6 @@ if TRITON_AVAILABLE:
     ) -> torch.Tensor:
         """Fused polynomial aggregation + mean (no mask).
 
-        Equivalent to the mask=None branch of polynomial_aggregation_ but
-        with a single-pass Triton kernel that avoids the (B, N, D, K)
-        intermediate.
-
         Args:
             x     : (B, N, D) input tensor
             coeff : (D, K)    polynomial coefficients
@@ -358,6 +406,6 @@ if TRITON_AVAILABLE:
         if k > 16:
             raise NotImplementedError(
                 f"Triton kernel supports k ≤ 16 (got {k}). "
-                "Extend the c0..c15 pattern or use the PyTorch fallback."
+                "Extend the c0..c15 / a0..a15 pattern or use the PyTorch fallback."
             )
         return _PolyAggMean.apply(x, coeff, k)

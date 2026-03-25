@@ -119,32 +119,59 @@ if not all_pass:
 # Benchmark helpers
 # =============================================================================
 
-def warmup_and_time(fn, *args, warmup: int = 5, reps: int = 50) -> float:
-    """Returns median wall-time in milliseconds over `reps` runs."""
-    import time
+import time
 
+def warmup_and_time(fn, *args, warmup: int = 5, reps: int = 50) -> float:
+    """Median forward-only wall-time in milliseconds."""
     for _ in range(warmup):
         fn(*args)
     torch.cuda.synchronize()
-
     times = []
     for _ in range(reps):
         t0 = time.perf_counter()
         fn(*args)
         torch.cuda.synchronize()
         times.append((time.perf_counter() - t0) * 1e3)
-
     times.sort()
-    return times[len(times) // 2]   # median
+    return times[len(times) // 2]
+
+
+def warmup_and_time_bwd(fn, x, coeff, K, warmup: int = 5, reps: int = 50) -> float:
+    """Median backward-only wall-time in milliseconds.
+
+    The forward pass is excluded: we pre-compute it, synchronise, then time
+    only the .backward() call.
+    """
+    def _fwd():
+        if x.grad is not None:
+            x.grad = None
+        if coeff.grad is not None:
+            coeff.grad = None
+        return fn(x, coeff, K).sum()
+
+    for _ in range(warmup):
+        _fwd().backward()
+    torch.cuda.synchronize()
+
+    times = []
+    for _ in range(reps):
+        loss = _fwd()
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        loss.backward()
+        torch.cuda.synchronize()
+        times.append((time.perf_counter() - t0) * 1e3)
+    times.sort()
+    return times[len(times) // 2]
 
 
 # =============================================================================
-# Benchmark
+# Forward benchmark
 # =============================================================================
 
 print()
 print("=" * 60)
-print("BENCHMARK  (B=4, K=3, bfloat16, median over 50 runs)")
+print("FORWARD BENCHMARK  (B=4, K=3, bfloat16, median over 50 runs)")
 print("=" * 60)
 print()
 
@@ -169,7 +196,35 @@ for N in Ns:
 
         speedup = t_pt / t_tr
         print(f"{N:>6}  {D:>6}  {t_pt:>14.3f}  {t_tr:>13.3f}  {speedup:>7.2f}x")
+    print()
 
+
+# =============================================================================
+# Backward benchmark
+# =============================================================================
+
+print()
+print("=" * 60)
+print("BACKWARD BENCHMARK  (B=4, K=3, bfloat16, median over 50 runs)")
+print("=" * 60)
+print()
+
+print(header)
+print("-" * len(header))
+
+for N in Ns:
+    for D in Ds:
+        torch.manual_seed(0)
+        x_pt = torch.randn(B, N, D, device=device).requires_grad_(True)
+        x_tr = torch.randn(B, N, D, device=device, dtype=torch.bfloat16).requires_grad_(True)
+        c_pt = torch.randn(D, K, device=device).requires_grad_(True)
+        c_tr = torch.randn(D, K, device=device).requires_grad_(True)
+
+        t_pt = warmup_and_time_bwd(poly_agg_mean_pt,     x_pt, c_pt, K)
+        t_tr = warmup_and_time_bwd(poly_agg_mean_triton, x_tr, c_tr, K)
+
+        speedup = t_pt / t_tr
+        print(f"{N:>6}  {D:>6}  {t_pt:>14.3f}  {t_tr:>13.3f}  {speedup:>7.2f}x")
     print()
 
 print("Done.")
