@@ -27,7 +27,7 @@ class JiTLightningModule(pl.LightningModule):
             pom_degree=cfg.model.get("pom_degree", 3),
             pom_expand=cfg.model.get("pom_expand", 1),
             pom_n_groups=cfg.model.get("pom_n_groups", 1),
-            pom_n_sel_heads=cfg.model.get("pom_n_sel_heads", 1),
+            pom_n_sel_heads=cfg.model.get("pom_n_sel_heads", 0),
             label_drop_prob=cfg.diffusion.label_drop_prob,
             P_mean=cfg.diffusion.P_mean,
             P_std=cfg.diffusion.P_std,

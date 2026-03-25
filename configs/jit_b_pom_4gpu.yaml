@@ -28,7 +28,7 @@ model:
   pom_degree: 3
   pom_expand: 1
   pom_n_groups: 1
-  pom_n_sel_heads: 1
+  pom_n_sel_heads: 0
 
 data:
   path: "./data/imagenet"

@@ -21,7 +21,7 @@ model:
   pom_degree: 3         # polynomial degree (pom only)
   pom_expand: 1         # channel expansion factor (pom only)
   pom_n_groups: 1       # grouped-conv groups for po_proj (pom only; 1 = no grouping)
-  pom_n_sel_heads: 1    # selection heads; 1 = scalar gating, >1 = multi-head gating (pom only)
+  pom_n_sel_heads: 0    # selection heads; 0 = match num_heads (recommended), >0 = explicit count (pom only)
 
 # --------------- Dataset ---------------
 data:

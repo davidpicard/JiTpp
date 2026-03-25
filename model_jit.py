@@ -206,7 +206,7 @@ class ComPoMWrapper(nn.Module):
 
 class JiTBlock(nn.Module):
     def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, attn_drop=0.0, proj_drop=0.0,
-                 mixer="attention", pom_degree=3, pom_expand=1, pom_n_groups=1, pom_n_sel_heads=1):
+                 mixer="attention", pom_degree=3, pom_expand=1, pom_n_groups=1, pom_n_sel_heads=0):
         super().__init__()
         self.norm1 = RMSNorm(hidden_size, eps=1e-6)
         if mixer == "pom":
@@ -255,7 +255,7 @@ class JiT(nn.Module):
         pom_degree=3,
         pom_expand=1,
         pom_n_groups=1,
-        pom_n_sel_heads=1,
+        pom_n_sel_heads=0,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -297,6 +297,9 @@ class JiT(nn.Module):
             pt_seq_len=hw_seq_len,
             num_cls_token=self.in_context_len
         )
+
+        # Resolve sentinel: 0 means "match num_heads" (same head-count heuristic as attention)
+        pom_n_sel_heads = num_heads if pom_n_sel_heads == 0 else pom_n_sel_heads
 
         # transformer
         self.blocks = nn.ModuleList([

@@ -99,7 +99,7 @@ class FlashAttnMixer(nn.Module):
 class PoMMixer(nn.Module):
     """ComPoM polynomial mixer."""
     def __init__(self, dim: int, expand: int = 1, degree: int = 3,
-                 n_sel_heads: int = 1):
+                 n_sel_heads: int = 0):
         super().__init__()
         self.pom = ComPoM(dim=dim, degree=degree, expand=expand,
                           n_groups=1, n_sel_heads=n_sel_heads)
@@ -190,10 +190,10 @@ Ns = [64, 128, 256, 512, 1024, 2048]
 mixers = {
     "jit-attn" : JiTAttnMixer(DIM, NUM_HEADS),
     "flash-attn": FlashAttnMixer(DIM, NUM_HEADS),
-    "pom-k2"   : PoMMixer(DIM, expand=2, degree=2),
-    "pom-k3"   : PoMMixer(DIM, expand=2, degree=3),
-    "pom-k4"   : PoMMixer(DIM, expand=2, degree=4),
-    "pom-k5"   : PoMMixer(DIM, expand=2, degree=5),
+    "pom-k2"   : PoMMixer(DIM, expand=2, degree=2, n_sel_heads=NUM_HEADS),
+    "pom-k3"   : PoMMixer(DIM, expand=2, degree=3, n_sel_heads=NUM_HEADS),
+    "pom-k4"   : PoMMixer(DIM, expand=2, degree=4, n_sel_heads=NUM_HEADS),
+    "pom-k5"   : PoMMixer(DIM, expand=2, degree=5, n_sel_heads=NUM_HEADS),
 }
 
 for name, m in mixers.items():
