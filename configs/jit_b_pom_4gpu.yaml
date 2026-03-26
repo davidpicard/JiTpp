@@ -26,7 +26,7 @@ model:
   proj_dropout: 0.0
   mixer: "pom"
   pom_degree: 3
-  pom_expand: 1
+  pom_expand: 2
   pom_n_groups: 1
   pom_n_sel_heads: 0
 
@@ -70,6 +70,6 @@ logging:
   wandb_project: "jitpp"
   wandb_experiment: "jit-b-pom-4gpu"
   wandb_offline: true
-  vis_every_n_steps: 25000
+  vis_every_n_steps: 12500
   vis_cfg: 2.5
   vis_sampling_steps: 20
