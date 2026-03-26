@@ -16,7 +16,7 @@ Forward kernel optimisations
 - X is streamed with eviction_policy="evict_first" to avoid polluting L2.
 - cache_modifier=".ca" on coeff loads provides an L1 fallback on spill.
 - K is tl.constexpr: the polynomial loop is fully unrolled.
-- Grid is a lambda so autotune's BLOCK_D is respected.
+- BLOCK_D is chosen by a Python heuristic (no autotuning, no file I/O).
 
 Backward kernel optimisations
 -------------------------------
@@ -48,39 +48,23 @@ except ImportError:
 if TRITON_AVAILABLE:
 
     # ---------------------------------------------------------------------------
-    # Autotune configs
+    # BLOCK_D heuristics — computed in Python, no autotuning, no file I/O.
+    #
+    # Forward: up to 256 (streaming kernel, light register pressure).
+    # Backward: up to 128 (heavier: coeff + grad_coeff accumulators in regs).
+    # Both: next power of 2 >= D, clamped to the respective cap.
     # ---------------------------------------------------------------------------
 
-    _FWD_CONFIGS = [
-        triton.Config({"BLOCK_D":  64}, num_warps=2, num_stages=3),
-        triton.Config({"BLOCK_D":  64}, num_warps=4, num_stages=4),
-        triton.Config({"BLOCK_D":  64}, num_warps=4, num_stages=6),
-        triton.Config({"BLOCK_D": 128}, num_warps=4, num_stages=3),
-        triton.Config({"BLOCK_D": 128}, num_warps=4, num_stages=4),
-        triton.Config({"BLOCK_D": 128}, num_warps=4, num_stages=6),
-        triton.Config({"BLOCK_D": 128}, num_warps=8, num_stages=3),
-        triton.Config({"BLOCK_D": 256}, num_warps=4, num_stages=2),
-        triton.Config({"BLOCK_D": 256}, num_warps=8, num_stages=3),
-    ]
+    def _fwd_block_d(D: int) -> int:
+        return min(256, 1 << (D - 1).bit_length())
 
-    # Fused backward has more live registers (coeff + grad_coeff accumulators),
-    # so the tile family is shifted toward smaller BLOCK_D.
-    _BWD_CONFIGS = [
-        triton.Config({"BLOCK_D":  32}, num_warps=2, num_stages=3),
-        triton.Config({"BLOCK_D":  32}, num_warps=4, num_stages=4),
-        triton.Config({"BLOCK_D":  64}, num_warps=2, num_stages=3),
-        triton.Config({"BLOCK_D":  64}, num_warps=4, num_stages=4),
-        triton.Config({"BLOCK_D":  64}, num_warps=4, num_stages=6),
-        triton.Config({"BLOCK_D": 128}, num_warps=4, num_stages=3),
-        triton.Config({"BLOCK_D": 128}, num_warps=4, num_stages=4),
-        triton.Config({"BLOCK_D": 128}, num_warps=8, num_stages=3),
-    ]
+    def _bwd_block_d(D: int) -> int:
+        return min(128, 1 << (D - 1).bit_length())
 
     # ---------------------------------------------------------------------------
     # Forward kernel
     # ---------------------------------------------------------------------------
 
-    @triton.autotune(configs=_FWD_CONFIGS, key=["N", "D", "K"])
     @triton.jit
     def _poly_agg_mean_fwd(
         X_ptr,          # (B, N, D) – input, any dtype
@@ -184,7 +168,6 @@ if TRITON_AVAILABLE:
     #   The same hp * h product serves both, so no extra multiply.
     # ---------------------------------------------------------------------------
 
-    @triton.autotune(configs=_BWD_CONFIGS, key=["N", "D", "K"], reset_to_zero=["GC_ptr"])
     @triton.jit
     def _poly_agg_mean_bwd(
         GO_ptr,         # (B, D)    – upstream gradient, fp32
@@ -349,12 +332,13 @@ if TRITON_AVAILABLE:
             coeff_c = coeff.float().contiguous()
             out     = torch.empty(B, D, dtype=torch.float32, device=x.device)
 
-            grid = lambda meta: (B, triton.cdiv(D, meta["BLOCK_D"]))
+            BLOCK_D = _fwd_block_d(D)
+            grid = (B, triton.cdiv(D, BLOCK_D))
             _poly_agg_mean_fwd[grid](
                 x_c, coeff_c, out,
                 N, D,
                 x_c.stride(0), x_c.stride(1),
-                K=k,
+                K=k, BLOCK_D=BLOCK_D,
             )
 
             ctx.save_for_backward(x_c, coeff_c)
@@ -374,12 +358,13 @@ if TRITON_AVAILABLE:
             # GC must be zero-initialised: the kernel accumulates via atomic_add.
             grad_c = torch.zeros(D, k, dtype=torch.float32, device=x.device)
 
-            grid = lambda meta: (B, triton.cdiv(D, meta["BLOCK_D"]))
+            BLOCK_D = _bwd_block_d(D)
+            grid = (B, triton.cdiv(D, BLOCK_D))
             _poly_agg_mean_bwd[grid](
                 go, x, coeff, grad_x_buf, grad_c,
                 B, N, D,
                 x.stride(0), x.stride(1),
-                K=k,
+                K=k, BLOCK_D=BLOCK_D,
             )
 
             return grad_x_buf.to(x.dtype), grad_c.to(coeff.dtype), None
