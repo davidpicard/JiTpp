@@ -112,19 +112,41 @@ def evaluate(cfg, ckpt_path: str, use_ema: bool = True, output_dir: str | None =
 
     if fid_stats_file and os.path.exists(fid_stats_file):
         print("Computing FID and IS...")
-        result = torch_fidelity.calculate_metrics(
+        cuda = torch.cuda.is_available()
+
+        # IS only needs input1
+        isc_result = torch_fidelity.calculate_metrics(
             input1=save_dir,
-            input2=None,
-            fid_statistics_file=fid_stats_file,
-            cuda=torch.cuda.is_available(),
-            isc=True,
-            fid=True,
-            kid=False,
-            prc=False,
+            cuda=cuda,
+            isc=True, fid=False, kid=False, prc=False,
             verbose=False,
         )
-        metrics["fid"] = result["frechet_inception_distance"]
-        metrics["is"] = result["inception_score_mean"]
+        metrics["is"] = isc_result[torch_fidelity.KEY_METRIC_ISC_MEAN]
+
+        # FID: extract inception stats for generated images, then compare
+        # against precomputed reference stats (torch_fidelity 0.4 dropped
+        # fid_statistics_file as a top-level param, so we use the lower-level API).
+        from torch_fidelity.metric_fid import (
+            create_feature_extractor,
+            fid_input_id_to_statistics_cached,
+            fid_statistics_to_metric,
+            resolve_feature_extractor,
+            resolve_feature_layer_for_metric,
+        )
+        fid_kwargs = dict(input1=save_dir, cuda=cuda, fid=True, verbose=False)
+        extractor_name = resolve_feature_extractor(**fid_kwargs)
+        feat_layer    = resolve_feature_layer_for_metric("fid", **fid_kwargs)
+        feat_extractor = create_feature_extractor(extractor_name, [feat_layer], **fid_kwargs)
+        stats_gen = fid_input_id_to_statistics_cached(1, feat_extractor, feat_layer, **fid_kwargs)
+
+        ref = np.load(fid_stats_file)
+        stats_ref = {
+            "mu":    ref["mu"].astype(stats_gen["mu"].dtype),
+            "sigma": ref["sigma"].astype(stats_gen["sigma"].dtype),
+        }
+
+        metrics["fid"] = fid_statistics_to_metric(stats_gen, stats_ref, False)[torch_fidelity.KEY_METRIC_FID]
+
         print(f"FID: {metrics['fid']:.4f}   IS: {metrics['is']:.4f}")
         shutil.rmtree(save_dir)
     else:
