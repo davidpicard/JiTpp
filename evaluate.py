@@ -83,8 +83,23 @@ def _load_denoiser(device: torch.device, cfg, ckpt_path: str, use_ema: bool):
 # Per-rank generation + in-memory feature extraction
 # ---------------------------------------------------------------------------
 
+def _progress(msg: str, rank: int, world_size: int) -> None:
+    """Print a progress line for `rank`, each GPU on its own fixed terminal line.
+
+    Before the generation loop the caller must have printed `world_size` blank
+    lines to reserve space.  The cursor sits one line below the last reserved
+    line; we move up to the correct row, overwrite it, and return.
+    """
+    if world_size > 1:
+        up = world_size - rank
+        print(f"\033[{up}A\r\033[K  {msg}\033[{up}B", end="", flush=True)
+    else:
+        print(f"  {msg}", end="\r", flush=True)
+
+
 def _generate_and_extract(
     denoiser, labels_chunk: np.ndarray, batch_size: int, device: torch.device,
+    rank: int = 0, world_size: int = 1,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Generate images for labels_chunk and extract InceptionV3 features.
 
@@ -125,7 +140,7 @@ def _generate_and_extract(
 
     num_chunk = len(labels_chunk)
     img_idx = 0
-    rank_prefix = f"[cuda:{device.index}] " if cuda else ""
+    label = f"cuda:{device.index}" if cuda else "cpu"
 
     with torch.no_grad():
         for start in range(0, num_chunk, batch_size):
@@ -148,11 +163,12 @@ def _generate_and_extract(
 
             pending_imgs = imgs_uint8
             img_idx += end - start
-            print(f"  {rank_prefix}{img_idx}/{num_chunk} images", end="\r", flush=True)
+            _progress(f"[{label}] {img_idx:>{len(str(num_chunk))}}/{num_chunk} images", rank, world_size)
 
     if pending_imgs is not None:
         _extract(pending_imgs)
-    print()
+    if world_size == 1:
+        print()  # finish the \r line
 
     pool3_np = torch.cat(pool3_list, dim=0).numpy().astype(np.float64)
     logits_np = torch.cat(logits_list, dim=0).numpy()
@@ -187,7 +203,7 @@ def _worker_in_memory(
     # cross-section of all classes, avoiding a degenerate per-GPU distribution.
     labels_chunk = labels_all[rank::world_size]
 
-    pool3_np, logits_np = _generate_and_extract(denoiser, labels_chunk, batch_size, device)
+    pool3_np, logits_np = _generate_and_extract(denoiser, labels_chunk, batch_size, device, rank, world_size)
     result_dict[rank] = (pool3_np, logits_np)
 
 
@@ -270,6 +286,10 @@ def evaluate(cfg, ckpt_path: str, use_ema: bool = True, output_dir: str | None =
             print("Warming InceptionV3 weight cache...")
             FeatureExtractorInceptionV3(name="inception-v3-compat", features_list=["2048"])
             print(f"Using {num_gpus} GPUs (in-memory pipeline)...")
+            # Reserve one terminal line per GPU for the progress display.
+            # Each worker will overwrite its own line using ANSI cursor moves.
+            for r in range(num_gpus):
+                print(f"  [cuda:{r}] waiting...", flush=True)
             ctx = mp.get_context("spawn")
             manager = ctx.Manager()
             result_dict = manager.dict()
@@ -279,6 +299,7 @@ def evaluate(cfg, ckpt_path: str, use_ema: bool = True, output_dir: str | None =
                 nprocs=num_gpus,
                 join=True,
             )
+            print()  # advance past the reserved progress block
             # Aggregate features from all workers in rank order
             pool3_parts = [result_dict[r][0] for r in range(num_gpus)]
             logits_parts = [result_dict[r][1] for r in range(num_gpus)]
