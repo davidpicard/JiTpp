@@ -78,6 +78,7 @@ def main() -> None:
         save_dir=cfg.logging.output_dir,
         offline=cfg.logging.wandb_offline,
         log_model=False,
+        config=OmegaConf.to_container(cfg, resolve=True),
     )
 
     # ------------------------------------------------------------------
