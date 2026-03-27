@@ -173,7 +173,6 @@ class FinalLayer(nn.Module):
             nn.Linear(hidden_size, 2 * hidden_size, bias=True)
         )
 
-    @torch.compile
     def forward(self, x, c):
         shift, scale = self.adaLN_modulation(c).chunk(2, dim=1)
         x = modulate(self.norm_final(x), shift, scale)
@@ -189,12 +188,13 @@ class ComPoMWrapper(nn.Module):
     PoM receives positionally-encoded features identical to what
     attention's Q and K see.
     """
-    def __init__(self, dim, num_heads, degree=3, expand=1, n_groups=1, n_sel_heads=1):
+    def __init__(self, dim, num_heads, degree=3, expand=1, n_groups=1):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
+        # n_sel_heads mirrors num_heads: one gating scalar per head, same as attention
         self.pom = ComPoM(dim=dim, degree=degree, expand=expand,
-                          n_groups=n_groups, n_sel_heads=n_sel_heads)
+                          n_groups=n_groups, n_sel_heads=num_heads)
 
     def forward(self, x, rope):
         B, N, C = x.shape
@@ -206,13 +206,12 @@ class ComPoMWrapper(nn.Module):
 
 class JiTBlock(nn.Module):
     def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, attn_drop=0.0, proj_drop=0.0,
-                 mixer="attention", pom_degree=3, pom_expand=1, pom_n_groups=1, pom_n_sel_heads=0):
+                 mixer="attention", pom_degree=3, pom_expand=1, pom_n_groups=1):
         super().__init__()
         self.norm1 = RMSNorm(hidden_size, eps=1e-6)
         if mixer == "pom":
             self.attn = ComPoMWrapper(hidden_size, num_heads=num_heads, degree=pom_degree,
-                                      expand=pom_expand, n_groups=pom_n_groups,
-                                      n_sel_heads=pom_n_sel_heads)
+                                      expand=pom_expand, n_groups=pom_n_groups)
         else:
             self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, qk_norm=True,
                                   attn_drop=attn_drop, proj_drop=proj_drop)
@@ -224,7 +223,6 @@ class JiTBlock(nn.Module):
             nn.Linear(hidden_size, 6 * hidden_size, bias=True)
         )
 
-    @torch.compile
     def forward(self, x, c, feat_rope=None):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=-1)
         x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa), rope=feat_rope)
@@ -255,7 +253,6 @@ class JiT(nn.Module):
         pom_degree=3,
         pom_expand=1,
         pom_n_groups=1,
-        pom_n_sel_heads=0,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -298,16 +295,13 @@ class JiT(nn.Module):
             num_cls_token=self.in_context_len
         )
 
-        # Resolve sentinel: 0 means "match num_heads" (same head-count heuristic as attention)
-        pom_n_sel_heads = num_heads if pom_n_sel_heads == 0 else pom_n_sel_heads
-
         # transformer
         self.blocks = nn.ModuleList([
             JiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio,
                      attn_drop=attn_drop if (depth // 4 * 3 > i >= depth // 4) else 0.0,
                      proj_drop=proj_drop if (depth // 4 * 3 > i >= depth // 4) else 0.0,
                      mixer=mixer, pom_degree=pom_degree, pom_expand=pom_expand,
-                     pom_n_groups=pom_n_groups, pom_n_sel_heads=pom_n_sel_heads)
+                     pom_n_groups=pom_n_groups)
             for i in range(depth)
         ])
 

@@ -15,7 +15,6 @@ class Denoiser(nn.Module):
         pom_degree: int = 3,
         pom_expand: int = 1,
         pom_n_groups: int = 1,
-        pom_n_sel_heads: int = 0,
         label_drop_prob: float = 0.1,
         P_mean: float = -0.8,
         P_std: float = 0.8,
@@ -38,7 +37,6 @@ class Denoiser(nn.Module):
             pom_degree=pom_degree,
             pom_expand=pom_expand,
             pom_n_groups=pom_n_groups,
-            pom_n_sel_heads=pom_n_sel_heads,
         )
         self.img_size = img_size
         self.num_classes = num_classes

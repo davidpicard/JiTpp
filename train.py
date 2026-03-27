@@ -60,7 +60,8 @@ def main() -> None:
     # pl.seed_everything is known to cause issues with Lightning's DDP workers
     # (broken RNG state propagation). Leave seeding to the user / launcher.
 
-    # Required for torch.compile used inside the model blocks
+    # optimize_ddp=False keeps DDP gradient hooks outside the compiled graph.
+    # cache_size_limit guards against unbounded recompilation cache growth.
     torch._dynamo.config.cache_size_limit = 128
     torch._dynamo.config.optimize_ddp = False
 

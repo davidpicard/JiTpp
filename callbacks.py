@@ -65,6 +65,7 @@ class VisualizationCallback(pl.Callback):
     # ------------------------------------------------------------------
 
     @torch.no_grad()
+    @torch.compiler.disable  # prevent torch.compile recompilation while ranks 1-N wait at barrier
     def _generate_and_log(self, trainer, pl_module) -> None:
         denoiser = pl_module.denoiser
         device = pl_module.device

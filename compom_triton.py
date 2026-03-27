@@ -328,28 +328,35 @@ if TRITON_AVAILABLE:
         @staticmethod
         def forward(ctx, x: torch.Tensor, coeff: torch.Tensor, k: int):
             B, N, D = x.shape
-            x_c     = x.contiguous()
+            # Do NOT call x.contiguous().  The kernel uses stride_xb / stride_xn,
+            # so it correctly reads a non-contiguous slice such as
+            # qc_proj_out[..., :po_dim] without an extra copy.
             coeff_c = coeff.float().contiguous()
             out     = torch.empty(B, D, dtype=torch.float32, device=x.device)
 
             BLOCK_D = _fwd_block_d(D)
             grid = (B, triton.cdiv(D, BLOCK_D))
             _poly_agg_mean_fwd[grid](
-                x_c, coeff_c, out,
+                x, coeff_c, out,
                 N, D,
-                x_c.stride(0), x_c.stride(1),
+                x.stride(0), x.stride(1),
                 K=k, BLOCK_D=BLOCK_D,
             )
 
-            ctx.save_for_backward(x_c, coeff_c)
+            ctx.save_for_backward(x, coeff_c)
             ctx.k = k
             return out.unsqueeze(1).to(x.dtype)
 
         @staticmethod
         def backward(ctx, grad_out: torch.Tensor):
-            x, coeff = ctx.saved_tensors
-            k        = ctx.k
-            B, N, D  = x.shape
+            x_saved, coeff = ctx.saved_tensors
+            k              = ctx.k
+            # Make contiguous for backward: the bwd kernel uses the same pointer
+            # layout for both reading X and writing GX, so a single stride set
+            # is needed.  The extra copy here is acceptable (bwd is not the
+            # bottleneck this optimisation targets).
+            x       = x_saved.contiguous()
+            B, N, D = x.shape
 
             go = grad_out.squeeze(1).float().contiguous()   # (B, D)
 
@@ -367,7 +374,7 @@ if TRITON_AVAILABLE:
                 K=k, BLOCK_D=BLOCK_D,
             )
 
-            return grad_x_buf.to(x.dtype), grad_c.to(coeff.dtype), None
+            return grad_x_buf.to(x_saved.dtype), grad_c.to(coeff.dtype), None
 
     # ---------------------------------------------------------------------------
     # Public entry point

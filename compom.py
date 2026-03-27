@@ -89,7 +89,8 @@ def polynomial_selection_(s: torch.Tensor, h: torch.Tensor, n_sel_heads: int) ->
     b, g, dh = h.shape
     t = s.shape[1]
     assert g == 1 or t == 1 or g == t, f"incompatible shapes: g={g} t={t}"
-    if n_sel_heads == 1:
+    if n_sel_heads <= 1:
+        # n_sel_heads=0 or 1: s has the same channel dim as h → element-wise gate
         return (s * h).view(b, max(g, t), dh)
     # Multi-head: s is (B, T, n_sel_heads); broadcast over head_dim
     s = s.unsqueeze(-1)
@@ -145,21 +146,48 @@ class ComPoM(nn.Module):
         self.n_groups = n_groups
         self.n_sel_heads = n_sel_heads
         assert dim % n_groups == 0, "dim must be divisible by n_groups"
-        assert dim * expand % n_sel_heads == 0, "dim * expand must be divisible by n_sel_heads"
-        self.head_dim = dim * expand // n_sel_heads
+        assert n_sel_heads <= 1 or dim * expand % n_sel_heads == 0, \
+            "dim * expand must be divisible by n_sel_heads"
+        self.head_dim = dim * expand // max(n_sel_heads, 1)
+
+        self._po_dim = expand * dim
+        self._se_dim = n_sel_heads if n_sel_heads > 1 else expand * dim
 
         if n_groups > 1:
+            # Grouped projection must stay as Conv1d; keep se_proj separate.
             self.po_proj = nn.Conv1d(dim, expand * dim, kernel_size=1, bias=bias, groups=n_groups)
+            self.se_proj = nn.Linear(dim, self._se_dim, bias=True)
         else:
-            self.po_proj = nn.Linear(dim, expand * dim, bias=bias)
+            # Fuse po_proj and se_proj into a single GEMM (qc_proj) with a
+            # standalone bias for the selection branch (se_bias).
+            self.qc_proj = nn.Linear(dim, self._po_dim + self._se_dim, bias=False)
+            self.se_bias = nn.Parameter(torch.zeros(self._se_dim))
+
         self.po_coeff = nn.Parameter(torch.randn(dim * expand, degree).clamp(-0.001, 0.001))
-        self.se_proj = nn.Linear(dim, n_sel_heads if n_sel_heads > 1 else expand * dim, bias=True)
         self.ag_proj = nn.Linear(expand * dim, dim, bias=bias)
 
-    def _project_context(self, xc: torch.Tensor) -> torch.Tensor:
+    def _get_h_s(
+        self, xq: torch.Tensor, xc: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return (h, s): projected context and hardsigmoid gating signal.
+
+        For n_groups == 1 and self-mixing (xq is xc), a single fused GEMM
+        produces both h and s, halving the projection cost.
+        """
         if self.n_groups > 1:
-            return self.po_proj(xc.transpose(1, 2)).transpose(1, 2)
-        return self.po_proj(xc)
+            h = self.po_proj(xc.transpose(1, 2)).transpose(1, 2)
+            s = F.hardsigmoid(self.se_proj(xq), inplace=True)
+        elif xq is xc:
+            out = self.qc_proj(xq)
+            h = out[..., :self._po_dim]
+            s = F.hardsigmoid(out[..., self._po_dim:] + self.se_bias, inplace=True)
+        else:
+            w = self.qc_proj.weight
+            h = F.linear(xc, w[:self._po_dim])
+            s = F.hardsigmoid(
+                F.linear(xq, w[self._po_dim:]) + self.se_bias, inplace=True
+            )
+        return h, s
 
     def forward(
         self,
@@ -174,8 +202,7 @@ class ComPoM(nn.Module):
         """
         if xc is None:
             xc = xq
-        h  = self._project_context(xc)
-        s  = F.hardsigmoid(self.se_proj(xq), inplace=True)
+        h, s = self._get_h_s(xq, xc)
         sh = pom(s, h, self.po_coeff, self.order, self.n_sel_heads, mask)
         return self.ag_proj(sh)
 
@@ -197,8 +224,8 @@ class ComPoM(nn.Module):
         """
         if xc is None:
             xc = xq
-        s = F.hardsigmoid(self.se_proj(xq), inplace=True)
-        h_current = polynomial_aggregation_(self._project_context(xc), self.po_coeff, self.order)
+        h_raw, s = self._get_h_s(xq, xc)
+        h_current = polynomial_aggregation_(h_raw, self.po_coeff, self.order)
         n_current = h_current.shape[1]
 
         if state is not None:
@@ -218,8 +245,7 @@ class ComPoM(nn.Module):
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """Autoregressive forward (no gradient tracking)."""
         B, T, D = xq.shape
-        h  = self._project_context(xq)
-        s  = F.hardsigmoid(self.se_proj(xq), inplace=True)
+        h, s = self._get_h_s(xq, xq)
         sh = polynomial_selection_(s, h, self.n_sel_heads)
         new_state = {'max_len': state['max_len'], 'h': h, 'n': state['n'] + T}
         return self.ag_proj(sh), new_state

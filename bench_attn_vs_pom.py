@@ -97,12 +97,14 @@ class FlashAttnMixer(nn.Module):
 
 
 class PoMMixer(nn.Module):
-    """ComPoM polynomial mixer."""
-    def __init__(self, dim: int, expand: int = 1, degree: int = 3,
-                 n_sel_heads: int = 0):
+    """ComPoM polynomial mixer (standalone, no RoPE).
+
+    n_sel_heads=num_heads matches ComPoMWrapper in the actual model.
+    """
+    def __init__(self, dim: int, num_heads: int, expand: int = 1, degree: int = 3):
         super().__init__()
         self.pom = ComPoM(dim=dim, degree=degree, expand=expand,
-                          n_groups=1, n_sel_heads=n_sel_heads)
+                          n_groups=1, n_sel_heads=num_heads)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.pom(x)
@@ -190,10 +192,10 @@ Ns = [64, 128, 256, 512, 1024, 2048]
 mixers = {
     "jit-attn" : JiTAttnMixer(DIM, NUM_HEADS),
     "flash-attn": FlashAttnMixer(DIM, NUM_HEADS),
-    "pom-k2"   : PoMMixer(DIM, expand=2, degree=2, n_sel_heads=NUM_HEADS),
-    "pom-k3"   : PoMMixer(DIM, expand=2, degree=3, n_sel_heads=NUM_HEADS),
-    "pom-k4"   : PoMMixer(DIM, expand=2, degree=4, n_sel_heads=NUM_HEADS),
-    "pom-k5"   : PoMMixer(DIM, expand=2, degree=5, n_sel_heads=NUM_HEADS),
+    "pom-k2"   : PoMMixer(DIM, num_heads=NUM_HEADS, expand=2, degree=2),
+    "pom-k3"   : PoMMixer(DIM, num_heads=NUM_HEADS, expand=2, degree=3),
+    "pom-k4"   : PoMMixer(DIM, num_heads=NUM_HEADS, expand=2, degree=4),
+    "pom-k5"   : PoMMixer(DIM, num_heads=NUM_HEADS, expand=2, degree=5),
 }
 
 for name, m in mixers.items():

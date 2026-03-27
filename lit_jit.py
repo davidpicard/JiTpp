@@ -27,7 +27,6 @@ class JiTLightningModule(pl.LightningModule):
             pom_degree=cfg.model.get("pom_degree", 3),
             pom_expand=cfg.model.get("pom_expand", 1),
             pom_n_groups=cfg.model.get("pom_n_groups", 1),
-            pom_n_sel_heads=cfg.model.get("pom_n_sel_heads", 0),
             label_drop_prob=cfg.diffusion.label_drop_prob,
             P_mean=cfg.diffusion.P_mean,
             P_std=cfg.diffusion.P_std,
@@ -43,6 +42,15 @@ class JiTLightningModule(pl.LightningModule):
         # EMA param lists — initialized lazily on first training batch
         self.ema_params1: list[torch.Tensor] | None = None
         self.ema_params2: list[torch.Tensor] | None = None
+
+    def configure_model(self) -> None:
+        # Called by Lightning after DDP wrapping, before training starts.
+        # Compiling here (rather than in __init__ or train.py) ensures the
+        # checkpoint state_dict always contains the original uncompiled weights
+        # and that the DDP hooks are already in place before compilation.
+        # dynamic=True avoids recompilation when shapes change (e.g. batch size
+        # during visualization, or seq-len change when in-context tokens are added).
+        self.denoiser = torch.compile(self.denoiser, dynamic=True)
 
     # ------------------------------------------------------------------
     # EMA helpers
@@ -93,6 +101,40 @@ class JiTLightningModule(pl.LightningModule):
             checkpoint["ema_params2"] = [p.cpu().clone() for p in self.ema_params2]
 
     def on_load_checkpoint(self, checkpoint: dict) -> None:
+        state = checkpoint.get("state_dict", {})
+
+        # Migrate old ComPoM checkpoints: po_proj+se_proj → qc_proj+se_bias.
+        # Old format: po_proj.weight (2-D Linear), se_proj.weight, se_proj.bias.
+        # New format: qc_proj.weight = cat([po_proj.weight, se_proj.weight], dim=0),
+        #             se_bias = se_proj.bias.
+        # The n_groups>1 path uses Conv1d (3-D weight) and is unchanged.
+        migrated = False
+        new_state: dict = {}
+        skip: set = set()
+        for k, v in state.items():
+            if k in skip:
+                continue
+            if k.endswith(".po_proj.weight") and v.dim() == 2:
+                base = k[: -len(".po_proj.weight")]
+                se_w_k = base + ".se_proj.weight"
+                se_b_k = base + ".se_proj.bias"
+                new_state[base + ".qc_proj.weight"] = torch.cat([v, state[se_w_k]], dim=0)
+                new_state[base + ".se_bias"] = state[se_b_k]
+                skip.update({se_w_k, se_b_k})
+                migrated = True
+            else:
+                new_state[k] = v
+        if migrated:
+            checkpoint["state_dict"] = new_state
+            # EMA param list order changed; discard stale EMA so it is
+            # re-initialised from the loaded weights on the first batch.
+            checkpoint.pop("ema_params1", None)
+            checkpoint.pop("ema_params2", None)
+            self.ema_params1 = None
+            self.ema_params2 = None
+            print("Migrated ComPoM checkpoint: po_proj+se_proj → qc_proj+se_bias (EMA reset)")
+            return
+
         if "ema_params1" in checkpoint:
             # Keep on CPU; _ensure_ema_ready() will move them on the first batch
             self.ema_params1 = checkpoint.pop("ema_params1")
