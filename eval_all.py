@@ -200,8 +200,22 @@ def main() -> None:
             else:
                 print("No metrics (FID stats unavailable for this resolution).")
 
+    run_id_final = run.id
     run.finish()
     print("\nDone.")
+
+    # In offline mode wandb writes a *new* offline-run-TIMESTAMP-{id} directory
+    # (separate from the training run's directory).  Print the sync command so
+    # the user knows exactly which path to upload.
+    if mode == "offline":
+        wandb_dir = os.path.join(output_dir, "wandb")
+        matches = sorted(
+            e for e in os.listdir(wandb_dir)
+            if e.startswith("offline-run-") and e.endswith(f"-{run_id_final}")
+        )
+        if matches:
+            sync_path = os.path.join(wandb_dir, matches[-1])
+            print(f"\nSync eval metrics with:\n  wandb sync {sync_path}")
 
 
 if __name__ == "__main__":
