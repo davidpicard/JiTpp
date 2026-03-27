@@ -174,19 +174,18 @@ def _worker_in_memory(
     result_dict,           # Manager().dict()
 ) -> None:
     """Spawned worker: load model on cuda:rank, generate label chunk, extract features."""
-    device = torch.device(f"cuda:{rank}")
-    # Suppress Lightning/tqdm output from worker ranks
     import logging
     logging.disable(logging.WARNING)
 
+    # Fix 3: diversify RNG so each worker generates different noise patterns.
+    torch.manual_seed(torch.initial_seed() + rank)
+
+    device = torch.device(f"cuda:{rank}")
     denoiser = _load_denoiser(device, cfg, ckpt_path, use_ema)
 
-    # Contiguous label split: rank r handles indices [r*k : (r+1)*k]
-    n = len(labels_all)
-    chunk = n // world_size
-    start_idx = rank * chunk
-    end_idx = start_idx + chunk if rank < world_size - 1 else n
-    labels_chunk = labels_all[start_idx:end_idx]
+    # Fix 2: interleaved (round-robin) split — every GPU sees a representative
+    # cross-section of all classes, avoiding a degenerate per-GPU distribution.
+    labels_chunk = labels_all[rank::world_size]
 
     pool3_np, logits_np = _generate_and_extract(denoiser, labels_chunk, batch_size, device)
     result_dict[rank] = (pool3_np, logits_np)
@@ -203,30 +202,29 @@ def _worker_to_disk(
     save_dir: str,
 ) -> None:
     """Spawned worker: generate label chunk and save images with correct global indices."""
-    device = torch.device(f"cuda:{rank}")
     import logging
     logging.disable(logging.WARNING)
 
+    torch.manual_seed(torch.initial_seed() + rank)
+
+    device = torch.device(f"cuda:{rank}")
     denoiser = _load_denoiser(device, cfg, ckpt_path, use_ema)
 
-    n = len(labels_all)
-    chunk = n // world_size
-    start_idx = rank * chunk
-    end_idx = start_idx + chunk if rank < world_size - 1 else n
-    labels_chunk = labels_all[start_idx:end_idx]
+    # Interleaved split: rank r handles labels_all[r], labels_all[r+N], ...
+    # Global file index for the i-th image of this rank = rank + i*world_size.
+    labels_chunk = labels_all[rank::world_size]
 
-    img_idx = start_idx
     with torch.no_grad():
-        for start in range(0, len(labels_chunk), batch_size):
-            end = min(start + batch_size, len(labels_chunk))
-            labels = torch.tensor(labels_chunk[start:end], dtype=torch.long, device=device)
+        for i_start in range(0, len(labels_chunk), batch_size):
+            i_end = min(i_start + batch_size, len(labels_chunk))
+            labels = torch.tensor(labels_chunk[i_start:i_end], dtype=torch.long, device=device)
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 images = denoiser.generate(labels)
             images = denormalize(images).clamp(0.0, 1.0).detach().cpu().numpy()
             for b in range(images.shape[0]):
+                global_idx = rank + (i_start + b) * world_size
                 img = np.round(images[b].transpose(1, 2, 0) * 255).astype(np.uint8)
-                cv2.imwrite(os.path.join(save_dir, f"{img_idx:05d}.png"), img[:, :, ::-1])
-                img_idx += 1
+                cv2.imwrite(os.path.join(save_dir, f"{global_idx:05d}.png"), img[:, :, ::-1])
 
 
 # ---------------------------------------------------------------------------
@@ -264,6 +262,13 @@ def evaluate(cfg, ckpt_path: str, use_ema: bool = True, output_dir: str | None =
 
     if has_fid_stats:
         if num_gpus > 1:
+            # Fix 1: load InceptionV3 in the main process before spawning workers so
+            # its weights are fully cached on disk.  Multiple workers simultaneously
+            # downloading to the same Lustre/NFS path causes cache corruption and
+            # produces garbage features → absurd FID.
+            from torch_fidelity.feature_extractor_inceptionv3 import FeatureExtractorInceptionV3
+            print("Warming InceptionV3 weight cache...")
+            FeatureExtractorInceptionV3(name="inception-v3-compat", features_list=["2048"])
             print(f"Using {num_gpus} GPUs (in-memory pipeline)...")
             ctx = mp.get_context("spawn")
             manager = ctx.Manager()
