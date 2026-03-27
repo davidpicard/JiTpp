@@ -11,8 +11,7 @@ Usage:
     python evaluate.py configs/jit_b_4gpu.yaml path/to/checkpoint.ckpt \\
         --override sampling.cfg=2.5 sampling.num_steps=100
 
-All available GPUs are used automatically.  Each GPU generates an equal share of
-images; features are extracted in-memory and aggregated on the coordinator process.
+Always runs on a single GPU (or CPU).  For multi-checkpoint parallelism use eval_all.py.
 """
 import argparse
 import copy
@@ -21,7 +20,6 @@ import os
 import cv2
 import numpy as np
 import torch
-import torch.multiprocessing as mp
 from omegaconf import OmegaConf
 from scipy.linalg import sqrtm
 
@@ -71,40 +69,28 @@ def _load_denoiser(device: torch.device, cfg, ckpt_path: str, use_ema: bool):
     denoiser = module.denoiser
 
     if use_ema and module.ema_params1 is not None:
+        print("Switching to EMA weights...")
         ema_state = copy.deepcopy(denoiser.state_dict())
         for i, (name, _) in enumerate(denoiser.named_parameters()):
             ema_state[name] = module.ema_params1[i]
         denoiser.load_state_dict(ema_state)
+    else:
+        print("Using raw model weights (no EMA).")
 
     return denoiser
 
 
 # ---------------------------------------------------------------------------
-# Per-rank generation + in-memory feature extraction
+# Generation + in-memory feature extraction (single GPU)
 # ---------------------------------------------------------------------------
 
-def _progress(msg: str, rank: int, world_size: int) -> None:
-    """Print a progress line for `rank`, each GPU on its own fixed terminal line.
-
-    Before the generation loop the caller must have printed `world_size` blank
-    lines to reserve space.  The cursor sits one line below the last reserved
-    line; we move up to the correct row, overwrite it, and return.
-    """
-    if world_size > 1:
-        up = world_size - rank
-        print(f"\033[{up}A\r\033[K  {msg}\033[{up}B", end="", flush=True)
-    else:
-        print(f"  {msg}", end="\r", flush=True)
-
-
 def _generate_and_extract(
-    denoiser, labels_chunk: np.ndarray, batch_size: int, device: torch.device,
-    rank: int = 0, world_size: int = 1,
+    denoiser, labels_all: np.ndarray, batch_size: int, device: torch.device,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Generate images for labels_chunk and extract InceptionV3 features.
+    """Generate images and extract InceptionV3 features in memory.
 
-    Uses a CUDA stream to overlap InceptionV3 with the next generation step.
-    Returns (pool3_np [N,2048], logits_np [N,1008]).
+    Uses a secondary CUDA stream to overlap InceptionV3 with the next
+    generation step.  Returns (pool3_np [N,2048], logits_np [N,1008]).
     """
     from torch_fidelity.feature_extractor_inceptionv3 import FeatureExtractorInceptionV3
 
@@ -138,18 +124,17 @@ def _generate_and_extract(
             pool3_list.append(feats[0].float())
             logits_list.append(feats[1].float())
 
-    num_chunk = len(labels_chunk)
+    num_images = len(labels_all)
     img_idx = 0
-    label = f"cuda:{device.index}" if cuda else "cpu"
 
     with torch.no_grad():
-        for start in range(0, num_chunk, batch_size):
+        for start in range(0, num_images, batch_size):
             if pending_imgs is not None:
                 _extract(pending_imgs)
                 pending_imgs = None
 
-            end = min(start + batch_size, num_chunk)
-            labels = torch.tensor(labels_chunk[start:end], dtype=torch.long, device=device)
+            end = min(start + batch_size, num_images)
+            labels = torch.tensor(labels_all[start:end], dtype=torch.long, device=device)
 
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 images = denoiser.generate(labels)
@@ -163,84 +148,15 @@ def _generate_and_extract(
 
             pending_imgs = imgs_uint8
             img_idx += end - start
-            _progress(f"[{label}] {img_idx:>{len(str(num_chunk))}}/{num_chunk} images", rank, world_size)
+            print(f"  {img_idx}/{num_images} images", end="\r", flush=True)
 
     if pending_imgs is not None:
         _extract(pending_imgs)
-    if world_size == 1:
-        print()  # finish the \r line
+    print()
 
     pool3_np = torch.cat(pool3_list, dim=0).numpy().astype(np.float64)
     logits_np = torch.cat(logits_list, dim=0).numpy()
     return pool3_np, logits_np
-
-
-# ---------------------------------------------------------------------------
-# Multi-GPU worker
-# ---------------------------------------------------------------------------
-
-def _worker_in_memory(
-    rank: int,
-    world_size: int,
-    cfg,
-    ckpt_path: str,
-    use_ema: bool,
-    labels_all: np.ndarray,
-    batch_size: int,
-    result_dict,           # Manager().dict()
-) -> None:
-    """Spawned worker: load model on cuda:rank, generate label chunk, extract features."""
-    import logging
-    logging.disable(logging.WARNING)
-
-    # Fix 3: diversify RNG so each worker generates different noise patterns.
-    torch.manual_seed(torch.initial_seed() + rank)
-
-    device = torch.device(f"cuda:{rank}")
-    denoiser = _load_denoiser(device, cfg, ckpt_path, use_ema)
-
-    # Fix 2: interleaved (round-robin) split — every GPU sees a representative
-    # cross-section of all classes, avoiding a degenerate per-GPU distribution.
-    labels_chunk = labels_all[rank::world_size]
-
-    pool3_np, logits_np = _generate_and_extract(denoiser, labels_chunk, batch_size, device, rank, world_size)
-    result_dict[rank] = (pool3_np, logits_np)
-
-
-def _worker_to_disk(
-    rank: int,
-    world_size: int,
-    cfg,
-    ckpt_path: str,
-    use_ema: bool,
-    labels_all: np.ndarray,
-    batch_size: int,
-    save_dir: str,
-) -> None:
-    """Spawned worker: generate label chunk and save images with correct global indices."""
-    import logging
-    logging.disable(logging.WARNING)
-
-    torch.manual_seed(torch.initial_seed() + rank)
-
-    device = torch.device(f"cuda:{rank}")
-    denoiser = _load_denoiser(device, cfg, ckpt_path, use_ema)
-
-    # Interleaved split: rank r handles labels_all[r], labels_all[r+N], ...
-    # Global file index for the i-th image of this rank = rank + i*world_size.
-    labels_chunk = labels_all[rank::world_size]
-
-    with torch.no_grad():
-        for i_start in range(0, len(labels_chunk), batch_size):
-            i_end = min(i_start + batch_size, len(labels_chunk))
-            labels = torch.tensor(labels_chunk[i_start:i_end], dtype=torch.long, device=device)
-            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                images = denoiser.generate(labels)
-            images = denormalize(images).clamp(0.0, 1.0).detach().cpu().numpy()
-            for b in range(images.shape[0]):
-                global_idx = rank + (i_start + b) * world_size
-                img = np.round(images[b].transpose(1, 2, 0) * 255).astype(np.uint8)
-                cv2.imwrite(os.path.join(save_dir, f"{global_idx:05d}.png"), img[:, :, ::-1])
 
 
 # ---------------------------------------------------------------------------
@@ -251,8 +167,7 @@ def evaluate(cfg, ckpt_path: str, use_ema: bool = True, output_dir: str | None =
     if output_dir is None:
         output_dir = cfg.logging.output_dir
 
-    num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
-    print(f"GPUs available: {num_gpus}")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     num_images = cfg.sampling.num_images
     batch_size = cfg.sampling.gen_batch_size
@@ -271,48 +186,14 @@ def evaluate(cfg, ckpt_path: str, use_ema: bool = True, output_dir: str | None =
     has_fid_stats = bool(fid_stats_file and os.path.exists(fid_stats_file))
 
     print(f"Loading checkpoint: {ckpt_path}")
-    ema_str = "EMA" if use_ema else "raw"
-    print(f"Weights: {ema_str}   images: {num_images}   batch: {batch_size}")
+    denoiser = _load_denoiser(device, cfg, ckpt_path, use_ema)
 
     metrics: dict = {}
 
     if has_fid_stats:
-        if num_gpus > 1:
-            # Fix 1: load InceptionV3 in the main process before spawning workers so
-            # its weights are fully cached on disk.  Multiple workers simultaneously
-            # downloading to the same Lustre/NFS path causes cache corruption and
-            # produces garbage features → absurd FID.
-            from torch_fidelity.feature_extractor_inceptionv3 import FeatureExtractorInceptionV3
-            print("Warming InceptionV3 weight cache...")
-            FeatureExtractorInceptionV3(name="inception-v3-compat", features_list=["2048"])
-            print(f"Using {num_gpus} GPUs (in-memory pipeline)...")
-            # Reserve one terminal line per GPU for the progress display.
-            # Each worker will overwrite its own line using ANSI cursor moves.
-            for r in range(num_gpus):
-                print(f"  [cuda:{r}] waiting...", flush=True)
-            ctx = mp.get_context("spawn")
-            manager = ctx.Manager()
-            result_dict = manager.dict()
-            mp.spawn(
-                _worker_in_memory,
-                args=(num_gpus, cfg, ckpt_path, use_ema, labels_all, batch_size, result_dict),
-                nprocs=num_gpus,
-                join=True,
-            )
-            print()  # advance past the reserved progress block
-            # Aggregate features from all workers in rank order
-            pool3_parts = [result_dict[r][0] for r in range(num_gpus)]
-            logits_parts = [result_dict[r][1] for r in range(num_gpus)]
-            all_pool3 = np.concatenate(pool3_parts, axis=0)
-            all_logits = np.concatenate(logits_parts, axis=0)
-        else:
-            print("Using 1 GPU (in-memory pipeline)..." if num_gpus == 1 else "Using CPU (in-memory)...")
-            device = torch.device("cuda" if num_gpus == 1 else "cpu")
-            denoiser = _load_denoiser(device, cfg, ckpt_path, use_ema)
-            print(f"Generating {num_images} images...")
-            all_pool3, all_logits = _generate_and_extract(denoiser, labels_all, batch_size, device)
+        print(f"Generating {num_images} images (in-memory)...")
+        all_pool3, all_logits = _generate_and_extract(denoiser, labels_all, batch_size, device)
 
-        # Compute metrics
         mu_gen = all_pool3.mean(axis=0)
         sigma_gen = np.cov(all_pool3, rowvar=False)
         ref = np.load(fid_stats_file)
@@ -325,52 +206,32 @@ def evaluate(cfg, ckpt_path: str, use_ema: bool = True, output_dir: str | None =
         metrics = {"fid": fid_score, "is": is_score}
 
     else:
-        # Fallback: save images to disk
+        s = cfg.sampling
         folder_name = "gen-{}-steps{}-cfg{}-interval{:.2f}-{:.2f}-n{}-res{}".format(
-            *_denoiser_id(cfg, ckpt_path, use_ema), num_images, img_size,
+            s.method, s.num_steps, s.cfg, s.interval_min, s.interval_max,
+            num_images, img_size,
         )
         save_dir = os.path.join(output_dir, folder_name)
         os.makedirs(save_dir, exist_ok=True)
         print(f"Generating {num_images} images → {save_dir}")
 
-        if num_gpus > 1:
-            mp.spawn(
-                _worker_to_disk,
-                args=(num_gpus, cfg, ckpt_path, use_ema, labels_all, batch_size, save_dir),
-                nprocs=num_gpus,
-                join=True,
-            )
-        else:
-            device = torch.device("cuda" if num_gpus == 1 else "cpu")
-            denoiser = _load_denoiser(device, cfg, ckpt_path, use_ema)
-            _save_to_disk(denoiser, labels_all, batch_size, device, save_dir, offset=0)
-
+        img_idx = 0
+        with torch.no_grad():
+            for start in range(0, num_images, batch_size):
+                end = min(start + batch_size, num_images)
+                labels = torch.tensor(labels_all[start:end], dtype=torch.long, device=device)
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    images = denoiser.generate(labels)
+                images = denormalize(images).clamp(0.0, 1.0).detach().cpu().numpy()
+                for b in range(images.shape[0]):
+                    img = np.round(images[b].transpose(1, 2, 0) * 255).astype(np.uint8)
+                    cv2.imwrite(os.path.join(save_dir, f"{img_idx:05d}.png"), img[:, :, ::-1])
+                    img_idx += 1
+                print(f"  {img_idx}/{num_images} images saved", end="\r")
+        print()
         print(f"No FID stats for {img_size}px — images saved at {save_dir}.")
 
     return metrics
-
-
-def _denoiser_id(cfg, ckpt_path: str, use_ema: bool) -> tuple:
-    """Return (method, steps, cfg_scale, interval_min, interval_max) from cfg for folder naming."""
-    s = cfg.sampling
-    return s.method, s.num_steps, s.cfg, s.interval_min, s.interval_max
-
-
-def _save_to_disk(denoiser, labels_chunk, batch_size, device, save_dir, offset=0):
-    img_idx = offset
-    with torch.no_grad():
-        for start in range(0, len(labels_chunk), batch_size):
-            end = min(start + batch_size, len(labels_chunk))
-            labels = torch.tensor(labels_chunk[start:end], dtype=torch.long, device=device)
-            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                images = denoiser.generate(labels)
-            images = denormalize(images).clamp(0.0, 1.0).detach().cpu().numpy()
-            for b in range(images.shape[0]):
-                img = np.round(images[b].transpose(1, 2, 0) * 255).astype(np.uint8)
-                cv2.imwrite(os.path.join(save_dir, f"{img_idx:05d}.png"), img[:, :, ::-1])
-                img_idx += 1
-            print(f"  {img_idx - offset}/{len(labels_chunk)} images saved", end="\r")
-    print()
 
 
 # ---------------------------------------------------------------------------
