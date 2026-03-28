@@ -45,13 +45,14 @@ class JiTLightningModule(pl.LightningModule):
 
     def configure_model(self) -> None:
         # Called by Lightning after DDP wrapping, before training starts.
-        # Compile only forward (not the whole module) so that parameter names
-        # stay as denoiser.net.* in state_dict.  torch.compile(module) wraps in
-        # an OptimizedModule that renames everything to _orig_mod.*, which breaks
-        # checkpoint loading when configure_model is called before load_state_dict.
+        # Compile net.forward — the JiT model used in both training and generation.
+        # Compiling the Denoiser wrapper (denoiser.forward) would only speed up
+        # the training loss path; generation calls self.net(...) directly and would
+        # get no benefit.  Compiling only the method (not the module) keeps
+        # state_dict keys unchanged (no _orig_mod prefix).
         # dynamic=True avoids recompilation when shapes change (e.g. batch size
         # during visualization, or seq-len change when in-context tokens are added).
-        self.denoiser.forward = torch.compile(self.denoiser.forward, dynamic=True)
+        self.denoiser.net.forward = torch.compile(self.denoiser.net.forward, dynamic=True)
 
     # ------------------------------------------------------------------
     # EMA helpers

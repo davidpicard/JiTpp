@@ -105,15 +105,27 @@ class Denoiser(nn.Module):
 
     @torch.no_grad()
     def _forward_sample(self, z, t, labels):
-        # conditional
-        x_cond = self.net(z, t.flatten(), labels)
-        v_cond = (x_cond - z) / (1.0 - t).clamp_min(self.t_eps)
+        t_flat = t.flatten()
 
-        # unconditional
-        x_uncond = self.net(z, t.flatten(), torch.full_like(labels, self.num_classes))
+        # cfg_scale=1.0: result is always v_cond regardless of the interval,
+        # so skip the unconditional pass entirely.
+        if self.cfg_scale == 1.0:
+            x_cond = self.net(z, t_flat, labels)
+            return (x_cond - z) / (1.0 - t).clamp_min(self.t_eps)
+
+        # cfg_scale>1.0: batch cond and uncond into a single forward pass to
+        # halve kernel-launch overhead and improve GPU utilisation.
+        uncond = torch.full_like(labels, self.num_classes)
+        x = self.net(
+            torch.cat([z, z], dim=0),
+            t_flat.repeat(2),
+            torch.cat([labels, uncond], dim=0),
+        )
+        x_cond, x_uncond = x.chunk(2, dim=0)
+
+        v_cond  = (x_cond  - z) / (1.0 - t).clamp_min(self.t_eps)
         v_uncond = (x_uncond - z) / (1.0 - t).clamp_min(self.t_eps)
 
-        # cfg interval
         low, high = self.cfg_interval
         interval_mask = (t < high) & ((low == 0) | (t > low))
         cfg_scale_interval = torch.where(interval_mask, self.cfg_scale, 1.0)

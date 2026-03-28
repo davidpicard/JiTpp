@@ -77,9 +77,10 @@ def _load_denoiser(device: torch.device, cfg, ckpt_path: str, use_ema: bool):
     else:
         print("Using raw model weights (no EMA).")
 
-    # Compile only forward — torch.compile on the whole module can return a
-    # plain function, losing denoiser.generate and other methods.
-    denoiser.forward = torch.compile(denoiser.forward, dynamic=True)
+    # Compile net.forward — the JiT model called inside both training forward
+    # and generation.  Compiling denoiser.forward (the loss wrapper) would have
+    # no effect on generation, which calls self.net(...) directly.
+    denoiser.net.forward = torch.compile(denoiser.net.forward, dynamic=True)
     return denoiser
 
 

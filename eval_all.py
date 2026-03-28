@@ -21,6 +21,7 @@ import argparse
 import os
 import re
 import sys
+import threading
 
 import torch
 import torch.multiprocessing as mp
@@ -28,6 +29,100 @@ import wandb
 from omegaconf import OmegaConf
 
 from evaluate import evaluate
+
+
+# ---------------------------------------------------------------------------
+# Multi-GPU live display
+# ---------------------------------------------------------------------------
+
+class _QueueWriter:
+    """Replaces sys.stdout in a worker process.
+
+    Buffers text and emits one ("status", rank, line) message per logical
+    line (split on \\n or \\r) to the shared display queue.  \\r lines
+    (in-place progress updates from evaluate.py) are emitted without
+    advancing the GPU's row, so the display thread keeps overwriting the
+    same terminal line.
+    """
+
+    def __init__(self, rank: int, queue) -> None:
+        self.rank = rank
+        self.queue = queue
+        self._buf = ""
+
+    def write(self, text: str) -> int:
+        self._buf += text
+        while True:
+            nl = self._buf.find("\n")
+            cr = self._buf.find("\r")
+            if nl == -1 and cr == -1:
+                break
+            # Whichever separator comes first wins
+            if cr != -1 and (nl == -1 or cr < nl):
+                line, self._buf = self._buf[:cr].strip(), self._buf[cr + 1:]
+            else:
+                line, self._buf = self._buf[:nl].strip(), self._buf[nl + 1:]
+            if line:
+                self.queue.put(("status", self.rank, line))
+        return len(text)
+
+    def flush(self) -> None:
+        line = self._buf.strip()
+        if line:
+            self.queue.put(("status", self.rank, line))
+            self._buf = ""
+
+    def isatty(self) -> bool:
+        return False
+
+
+def _run_display(display_queue, num_gpus: int) -> None:
+    """Display thread: one status row per GPU, permanent log lines above them.
+
+    Messages are tuples:
+      ("status", rank, text)  — overwrite GPU rank's row in-place
+      ("log",    None, text)  — insert a permanent line above the status area
+      None                    — stop sentinel
+
+    Falls back to plain print() when stdout is not a TTY (e.g. redirected
+    to a file), so escape codes never pollute log files.
+    """
+    rows = [f"GPU {i}: starting…" for i in range(num_gpus)]
+    tty = sys.stdout.isatty()
+
+    if tty:
+        sys.stdout.write("\n".join(rows) + "\n")
+        sys.stdout.flush()
+
+    while True:
+        msg = display_queue.get()
+        if msg is None:
+            break
+
+        kind, rank, text = msg
+
+        if not tty:
+            if kind == "log":
+                print(text, flush=True)
+            continue
+
+        if kind == "log":
+            # Move up to the top of the status area, insert a blank line so
+            # the status rows shift down, write the log line, then repaint.
+            sys.stdout.write(
+                f"\033[{num_gpus}A"   # cursor to top of status area
+                f"\033[1L"            # insert blank line (CSI L — xterm/VTE)
+                f"\033[2K\r{text}\n"  # write log, cursor now on first status row
+            )
+            for row in rows:
+                sys.stdout.write(f"\033[2K\r{row}\n")
+        else:
+            rows[rank] = f"GPU {rank}: {text}"
+            sys.stdout.write(f"\033[{num_gpus}A")
+            for row in rows:
+                sys.stdout.write(f"\033[2K\r{row}\n")
+
+        sys.stdout.flush()
 
 
 # ---------------------------------------------------------------------------
@@ -79,6 +174,7 @@ def _eval_worker(
     ckpt_groups: list,      # ckpt_groups[rank] = [(step, path), ...]
     use_ema: bool,
     result_queue,           # mp.Queue — worker puts (step, metrics) as each ckpt finishes
+    display_queue=None,     # mp.Queue — routes stdout to the live display thread
 ) -> None:
     """Spawned worker: restrict to cuda:rank and evaluate assigned checkpoints."""
     # Restrict CUDA visibility to this rank's GPU before any CUDA call.
@@ -87,11 +183,17 @@ def _eval_worker(
     import logging
     logging.disable(logging.WARNING)
 
+    # Route all prints (including progress lines from evaluate.py) to the
+    # live display.  Falls back to normal stdout when no queue is provided.
+    if display_queue is not None:
+        sys.stdout = _QueueWriter(rank, display_queue)
+
     for step, ckpt_path in ckpt_groups[rank]:
-        print(f"\n[GPU {rank}] {'=' * 50}")
-        print(f"[GPU {rank}] Step {step}  —  {ckpt_path}")
+        print(f"step {step} — {os.path.basename(ckpt_path)}")
         metrics = evaluate(cfg, ckpt_path, use_ema=use_ema)
         result_queue.put((step, metrics))
+
+    sys.stdout.flush()
 
 
 # ---------------------------------------------------------------------------
@@ -173,16 +275,23 @@ def main() -> None:
 
         ctx = mp.get_context("spawn")
         result_queue = ctx.Queue()
+        display_queue = ctx.Queue()
 
         workers = [
             ctx.Process(
                 target=_eval_worker,
-                args=(rank, cfg, ckpt_groups, use_ema, result_queue),
+                args=(rank, cfg, ckpt_groups, use_ema, result_queue, display_queue),
             )
             for rank in range(num_gpus)
         ]
         for w in workers:
             w.start()
+
+        # Display thread: one live status row per GPU in the terminal.
+        disp_thread = threading.Thread(
+            target=_run_display, args=(display_queue, num_gpus), daemon=True
+        )
+        disp_thread.start()
 
         # Log each result as soon as any worker produces it.
         # checkpoint_step is a plain data value (not the wandb step= kwarg),
@@ -192,12 +301,15 @@ def main() -> None:
             if metrics:
                 log_dict = {f"eval/{metric_prefix}/{k}": v for k, v in metrics.items()}
                 run.log({"checkpoint_step": step, **log_dict})
-                print(f"Logged {log_dict} at step {step}")
+                display_queue.put(("log", None, f"Logged {log_dict} at step {step}"))
             else:
-                print(f"Step {step}: no metrics (FID stats unavailable).")
+                display_queue.put(("log", None, f"Step {step}: no metrics (FID stats unavailable)."))
 
         for w in workers:
             w.join()
+
+        display_queue.put(None)   # stop display thread
+        disp_thread.join()
 
     else:
         # Single GPU or CPU: evaluate sequentially
