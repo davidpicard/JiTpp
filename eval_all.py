@@ -253,12 +253,20 @@ def main() -> None:
     metric_prefix = "raw" if args.no_ema else "ema"
     use_ema = not args.no_ema
 
-    # Register eval metrics with a custom x-axis ("checkpoint_step") so that
-    # they are never dropped due to wandb's monotonic-step constraint.
-    # Without this, run.log(data, step=N) silently drops any N that is <=
-    # the training run's last committed step.
-    run.define_metric("checkpoint_step")
-    run.define_metric(f"eval/{metric_prefix}/*", step_metric="checkpoint_step")
+    # Accumulated results for the summary table logged at the end.
+    # Keys are metric names; values are lists of (step, value) pairs.
+    all_results: list[tuple[int, dict]] = []
+
+    def _log_result(step: int, metrics: dict) -> None:
+        """Log one checkpoint result eagerly and accumulate for the summary table."""
+        if not metrics:
+            return
+        log_dict = {f"eval/{metric_prefix}/{k}": v for k, v in metrics.items()}
+        # Log without step= kwarg so wandb auto-increments its internal counter.
+        # checkpoint_step is a plain data column — wandb never reorders or drops it
+        # based on its monotonic-step constraint (only the step= kwarg triggers that).
+        run.log({"checkpoint_step": step, **log_dict})
+        all_results.append((step, metrics))
 
     # --- evaluate: multi-GPU or single-GPU ----------------------------------
     num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
@@ -294,13 +302,11 @@ def main() -> None:
         disp_thread.start()
 
         # Log each result as soon as any worker produces it.
-        # checkpoint_step is a plain data value (not the wandb step= kwarg),
-        # so out-of-order arrival is fine.
         for _ in range(len(ckpts)):
             step, metrics = result_queue.get()
             if metrics:
+                _log_result(step, metrics)
                 log_dict = {f"eval/{metric_prefix}/{k}": v for k, v in metrics.items()}
-                run.log({"checkpoint_step": step, **log_dict})
                 display_queue.put(("log", None, f"Logged {log_dict} at step {step}"))
             else:
                 display_queue.put(("log", None, f"Step {step}: no metrics (FID stats unavailable)."))
@@ -318,11 +324,23 @@ def main() -> None:
             print(f"Step {step}  —  {ckpt_path}")
             metrics = evaluate(cfg, ckpt_path, use_ema=use_ema)
             if metrics:
+                _log_result(step, metrics)
                 log_dict = {f"eval/{metric_prefix}/{k}": v for k, v in metrics.items()}
-                run.log({"checkpoint_step": step, **log_dict})
                 print(f"Logged {log_dict} at step {step}")
             else:
                 print("No metrics (FID stats unavailable for this resolution).")
+
+    # Log a summary table sorted by step so the wandb UI can plot metrics
+    # against checkpoint_step without needing define_metric.
+    # (define_metric writes a wandb_metric protobuf message type that causes
+    # ParseFromString errors during `wandb sync` on some wandb versions.)
+    if all_results:
+        all_results.sort(key=lambda x: x[0])
+        metric_keys = sorted(all_results[0][1].keys())
+        table = wandb.Table(columns=["checkpoint_step"] + [f"eval/{metric_prefix}/{k}" for k in metric_keys])
+        for step, metrics in all_results:
+            table.add_data(step, *[metrics[k] for k in metric_keys])
+        run.log({f"eval/{metric_prefix}/summary": table})
 
     run_id_final = run.id
     run.finish()
