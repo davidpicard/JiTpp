@@ -45,12 +45,13 @@ class JiTLightningModule(pl.LightningModule):
 
     def configure_model(self) -> None:
         # Called by Lightning after DDP wrapping, before training starts.
-        # Compiling here (rather than in __init__ or train.py) ensures the
-        # checkpoint state_dict always contains the original uncompiled weights
-        # and that the DDP hooks are already in place before compilation.
+        # Compile only forward (not the whole module) so that parameter names
+        # stay as denoiser.net.* in state_dict.  torch.compile(module) wraps in
+        # an OptimizedModule that renames everything to _orig_mod.*, which breaks
+        # checkpoint loading when configure_model is called before load_state_dict.
         # dynamic=True avoids recompilation when shapes change (e.g. batch size
         # during visualization, or seq-len change when in-context tokens are added).
-        self.denoiser = torch.compile(self.denoiser, dynamic=True)
+        self.denoiser.forward = torch.compile(self.denoiser.forward, dynamic=True)
 
     # ------------------------------------------------------------------
     # EMA helpers
