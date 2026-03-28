@@ -75,11 +75,10 @@ def find_checkpoints(output_dir: str) -> list[tuple[int, str]]:
 
 def _eval_worker(
     rank: int,
-    world_size: int,
     cfg,
     ckpt_groups: list,      # ckpt_groups[rank] = [(step, path), ...]
     use_ema: bool,
-    result_dict,            # Manager().dict(), keyed by step
+    result_queue,           # mp.Queue — worker puts (step, metrics) as each ckpt finishes
 ) -> None:
     """Spawned worker: restrict to cuda:rank and evaluate assigned checkpoints."""
     # Restrict CUDA visibility to this rank's GPU before any CUDA call.
@@ -92,8 +91,7 @@ def _eval_worker(
         print(f"\n[GPU {rank}] {'=' * 50}")
         print(f"[GPU {rank}] Step {step}  —  {ckpt_path}")
         metrics = evaluate(cfg, ckpt_path, use_ema=use_ema)
-        if metrics:
-            result_dict[step] = metrics
+        result_queue.put((step, metrics))
 
 
 # ---------------------------------------------------------------------------
@@ -153,6 +151,13 @@ def main() -> None:
     metric_prefix = "raw" if args.no_ema else "ema"
     use_ema = not args.no_ema
 
+    # Register eval metrics with a custom x-axis ("checkpoint_step") so that
+    # they are never dropped due to wandb's monotonic-step constraint.
+    # Without this, run.log(data, step=N) silently drops any N that is <=
+    # the training run's last committed step.
+    run.define_metric("checkpoint_step")
+    run.define_metric(f"eval/{metric_prefix}/*", step_metric="checkpoint_step")
+
     # --- evaluate: multi-GPU or single-GPU ----------------------------------
     num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
 
@@ -167,25 +172,32 @@ def main() -> None:
         print()
 
         ctx = mp.get_context("spawn")
-        manager = ctx.Manager()
-        result_dict = manager.dict()
+        result_queue = ctx.Queue()
 
-        mp.spawn(
-            _eval_worker,
-            args=(num_gpus, cfg, ckpt_groups, use_ema, result_dict),
-            nprocs=num_gpus,
-            join=True,
-        )
+        workers = [
+            ctx.Process(
+                target=_eval_worker,
+                args=(rank, cfg, ckpt_groups, use_ema, result_queue),
+            )
+            for rank in range(num_gpus)
+        ]
+        for w in workers:
+            w.start()
 
-        # Log results in step order
-        for step, ckpt_path in ckpts:
-            metrics = result_dict.get(step)
+        # Log each result as soon as any worker produces it.
+        # checkpoint_step is a plain data value (not the wandb step= kwarg),
+        # so out-of-order arrival is fine.
+        for _ in range(len(ckpts)):
+            step, metrics = result_queue.get()
             if metrics:
                 log_dict = {f"eval/{metric_prefix}/{k}": v for k, v in metrics.items()}
-                run.log(log_dict, step=step)
+                run.log({"checkpoint_step": step, **log_dict})
                 print(f"Logged {log_dict} at step {step}")
             else:
                 print(f"Step {step}: no metrics (FID stats unavailable).")
+
+        for w in workers:
+            w.join()
 
     else:
         # Single GPU or CPU: evaluate sequentially
@@ -195,7 +207,7 @@ def main() -> None:
             metrics = evaluate(cfg, ckpt_path, use_ema=use_ema)
             if metrics:
                 log_dict = {f"eval/{metric_prefix}/{k}": v for k, v in metrics.items()}
-                run.log(log_dict, step=step)
+                run.log({"checkpoint_step": step, **log_dict})
                 print(f"Logged {log_dict} at step {step}")
             else:
                 print("No metrics (FID stats unavailable for this resolution).")

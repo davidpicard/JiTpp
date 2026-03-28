@@ -77,6 +77,9 @@ def _load_denoiser(device: torch.device, cfg, ckpt_path: str, use_ema: bool):
     else:
         print("Using raw model weights (no EMA).")
 
+    # Compile only forward — torch.compile on the whole module can return a
+    # plain function, losing denoiser.generate and other methods.
+    denoiser.forward = torch.compile(denoiser.forward, dynamic=True)
     return denoiser
 
 
@@ -117,7 +120,8 @@ def _generate_and_extract(
                     feats = inception(imgs_uint8)
                 pool3_list.append(feats[0].float().cpu())
                 logits_list.append(feats[1].float().cpu())
-            inception_stream.synchronize()
+            # Do NOT synchronize here — let generation of the next batch
+            # overlap with InceptionV3 on the secondary stream.
         else:
             with torch.no_grad():
                 feats = inception(imgs_uint8)
@@ -152,6 +156,8 @@ def _generate_and_extract(
 
     if pending_imgs is not None:
         _extract(pending_imgs)
+    if inception_stream is not None:
+        inception_stream.synchronize()
     print()
 
     pool3_np = torch.cat(pool3_list, dim=0).numpy().astype(np.float64)
