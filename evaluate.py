@@ -171,6 +171,9 @@ def _generate_and_extract(
 # ---------------------------------------------------------------------------
 
 def evaluate(cfg, ckpt_path: str, use_ema: bool = True, output_dir: str | None = None) -> dict:
+    torch.backends.cuda.matmul.fp32_precision = "tf32"
+    torch.backends.cudnn.conv.fp32_precision = "tf32"
+
     if output_dir is None:
         output_dir = cfg.logging.output_dir
 
