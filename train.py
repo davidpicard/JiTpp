@@ -65,11 +65,10 @@ def main() -> None:
     torch._dynamo.config.cache_size_limit = 128
     torch._dynamo.config.optimize_ddp = False
 
-    # Use the new TF32 API (PyTorch 2.9+) to avoid deprecation warnings from
-    # Lightning/compile reading the old allow_tf32 getter.  TF32 gives ~3×
-    # faster fp32 matmul on Ampere+ with negligible precision loss for training.
-    torch.backends.cuda.matmul.fp32_precision = "tf32"
-    torch.backends.cudnn.conv.fp32_precision = "tf32"
+    # TF32 gives ~3× faster fp32 matmul on Ampere+ with negligible precision
+    # loss for training.  Use the generic setter so Lightning's internal
+    # get_float32_matmul_precision() call does not raise a "mixed API" error.
+    torch.set_float32_matmul_precision("high")
 
     os.makedirs(cfg.logging.output_dir, exist_ok=True)
 
