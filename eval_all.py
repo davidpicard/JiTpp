@@ -1,20 +1,18 @@
 #!/usr/bin/env python3
 """Evaluate all step checkpoints in an output directory and log FID/IS to wandb.
 
-Recovers the existing wandb run from the output directory so metrics
-appear on the same run as the training curves.  If multiple training
-runs exist (e.g. after several resumes), --run-id lets you pick
-explicitly; otherwise the most recent run (latest-run symlink) is used.
+Creates a fresh wandb run named <experiment>-eval-{ema|raw} so that sync
+works reliably in offline mode.  Group it with the training run manually
+in the wandb UI.
 
 When multiple GPUs are available, checkpoints are distributed across them
 (one GPU per checkpoint, round-robin).  Each GPU runs the full single-GPU
 evaluation pipeline independently — no cross-GPU communication.
-Results are collected by the main process and logged to wandb in step order.
+Results are logged to wandb as each checkpoint finishes (out-of-order fine).
 
 Usage:
     python eval_all.py configs/jit_b_pom_4gpu.yaml
     python eval_all.py configs/jit_b_pom_4gpu.yaml --no-ema
-    python eval_all.py configs/jit_b_pom_4gpu.yaml --run-id abcdef12
     python eval_all.py configs/jit_b_pom_4gpu.yaml --override sampling.cfg=2.5
 """
 import argparse
@@ -129,19 +127,6 @@ def _run_display(display_queue, num_gpus: int) -> None:
 # Helpers
 # ---------------------------------------------------------------------------
 
-def find_run_id(output_dir: str) -> str | None:
-    """Read the wandb run ID from the latest-run symlink in output_dir/wandb/.
-
-    WandbLogger creates <output_dir>/wandb/latest-run -> run-DATE-<run_id>.
-    The run_id is the alphanumeric suffix after the last '-'.
-    """
-    link = os.path.join(output_dir, "wandb", "latest-run")
-    if os.path.islink(link):
-        target = os.readlink(link)          # e.g. "run-20260327_120000-abcdef12"
-        return target.rsplit("-", 1)[-1]
-    return None
-
-
 def step_from_ckpt(path: str) -> int | None:
     """Return the training step encoded in a filename like step-step=00050000.ckpt."""
     m = re.search(r"step-step=(\d+)\.ckpt$", os.path.basename(path))
@@ -205,8 +190,6 @@ def main() -> None:
     parser.add_argument("config", help="Path to YAML config file")
     parser.add_argument("--no-ema", action="store_true",
                         help="Use raw model weights instead of EMA")
-    parser.add_argument("--run-id", default=None,
-                        help="Wandb run ID to resume (auto-detected if omitted)")
     parser.add_argument("--override", nargs="*", default=[], metavar="KEY=VALUE",
                         help="Dot-list config overrides, e.g. sampling.cfg=2.5")
     args = parser.parse_args()
@@ -227,46 +210,30 @@ def main() -> None:
         print(f"  step {step:>8d}  {path}")
     print()
 
-    # --- connect to wandb run -----------------------------------------------
-    run_id = args.run_id or find_run_id(output_dir)
+    # --- create a fresh wandb run for eval metrics --------------------------
+    # Always create a new run rather than resuming the training run.
+    # Resuming a closed offline run and appending records to it causes
+    # protobuf parse errors during `wandb sync` on some wandb versions.
+    # Name the run <experiment>-eval so it is easy to group with the
+    # training run in the wandb UI.
     mode = "offline" if cfg.logging.wandb_offline else "online"
-
-    if run_id:
-        print(f"Resuming wandb run {run_id!r} (mode={mode})")
-        run = wandb.init(
-            project=cfg.logging.wandb_project,
-            id=run_id,
-            resume="must",
-            dir=output_dir,
-            mode=mode,
-        )
-    else:
-        print("No existing wandb run found — creating a new one.")
-        run = wandb.init(
-            project=cfg.logging.wandb_project,
-            name=cfg.logging.wandb_experiment,
-            config=OmegaConf.to_container(cfg, resolve=True),
-            dir=output_dir,
-            mode=mode,
-        )
-
     metric_prefix = "raw" if args.no_ema else "ema"
+    run = wandb.init(
+        project=cfg.logging.wandb_project,
+        name=f"{cfg.logging.wandb_experiment}-eval-{metric_prefix}",
+        config=OmegaConf.to_container(cfg, resolve=True),
+        dir=output_dir,
+        mode=mode,
+    )
+    print(f"Started wandb run {run.id!r} (mode={mode})")
+
     use_ema = not args.no_ema
 
-    # Accumulated results for the summary table logged at the end.
-    # Keys are metric names; values are lists of (step, value) pairs.
-    all_results: list[tuple[int, dict]] = []
-
     def _log_result(step: int, metrics: dict) -> None:
-        """Log one checkpoint result eagerly and accumulate for the summary table."""
         if not metrics:
             return
         log_dict = {f"eval/{metric_prefix}/{k}": v for k, v in metrics.items()}
-        # Log without step= kwarg so wandb auto-increments its internal counter.
-        # checkpoint_step is a plain data column — wandb never reorders or drops it
-        # based on its monotonic-step constraint (only the step= kwarg triggers that).
         run.log({"checkpoint_step": step, **log_dict})
-        all_results.append((step, metrics))
 
     # --- evaluate: multi-GPU or single-GPU ----------------------------------
     num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
@@ -329,18 +296,6 @@ def main() -> None:
                 print(f"Logged {log_dict} at step {step}")
             else:
                 print("No metrics (FID stats unavailable for this resolution).")
-
-    # Log a summary table sorted by step so the wandb UI can plot metrics
-    # against checkpoint_step without needing define_metric.
-    # (define_metric writes a wandb_metric protobuf message type that causes
-    # ParseFromString errors during `wandb sync` on some wandb versions.)
-    if all_results:
-        all_results.sort(key=lambda x: x[0])
-        metric_keys = sorted(all_results[0][1].keys())
-        table = wandb.Table(columns=["checkpoint_step"] + [f"eval/{metric_prefix}/{k}" for k in metric_keys])
-        for step, metrics in all_results:
-            table.add_data(step, *[metrics[k] for k in metric_keys])
-        run.log({f"eval/{metric_prefix}/summary": table})
 
     run_id_final = run.id
     run.finish()
