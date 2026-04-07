@@ -27,7 +27,7 @@ if not torch.cuda.is_available():
 
 device = torch.device("cuda")
 
-from compom import ComPoM
+from pom import PoM
 from util.model_util import RMSNorm
 
 print(f"GPU    : {torch.cuda.get_device_name(0)}")
@@ -97,14 +97,14 @@ class FlashAttnMixer(nn.Module):
 
 
 class PoMMixer(nn.Module):
-    """ComPoM polynomial mixer (standalone, no RoPE).
+    """PoM polynomial mixer (standalone, no RoPE).
 
-    n_sel_heads=num_heads matches ComPoMWrapper in the actual model.
+    n_sel_heads=num_heads matches the actual model.
     """
     def __init__(self, dim: int, num_heads: int, expand: int = 1, degree: int = 3):
         super().__init__()
-        self.pom = ComPoM(dim=dim, degree=degree, expand=expand,
-                          n_groups=1, n_sel_heads=num_heads)
+        self.pom = PoM(dim=dim, degree=degree, expand=expand,
+                       n_groups=1, n_sel_heads=num_heads)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.pom(x)

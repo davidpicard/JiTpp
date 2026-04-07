@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.pth
+*.ckpt
+output/
+data/
+fid_stats/
+wandb/
+*.egg-info/
+dist/
+build/
+.env

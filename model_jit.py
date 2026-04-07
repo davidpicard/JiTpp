@@ -8,7 +8,7 @@ import torch.nn as nn
 import math
 import torch.nn.functional as F
 from util.model_util import VisionRotaryEmbeddingFast, get_2d_sincos_pos_embed, RMSNorm
-from compom import ComPoM
+from pom import PoMRoPE
 
 
 def modulate(x, shift, scale):
@@ -180,38 +180,15 @@ class FinalLayer(nn.Module):
         return x
 
 
-class ComPoMWrapper(nn.Module):
-    """Wraps ComPoM to match the Attention(x, rope) interface.
-
-    RoPE is applied to x by temporarily splitting it into the same
-    (B, num_heads, N, head_dim) layout used by Attention, so that
-    PoM receives positionally-encoded features identical to what
-    attention's Q and K see.
-    """
-    def __init__(self, dim, num_heads, degree=3, expand=1, n_groups=1):
-        super().__init__()
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        # n_sel_heads mirrors num_heads: one gating scalar per head, same as attention
-        self.pom = ComPoM(dim=dim, degree=degree, expand=expand,
-                          n_groups=n_groups, n_sel_heads=num_heads)
-
-    def forward(self, x, rope):
-        B, N, C = x.shape
-        x = x.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)  # (B, H, N, head_dim)
-        x = rope(x)
-        x = x.transpose(1, 2).reshape(B, N, C)
-        return self.pom(x)
-
-
 class JiTBlock(nn.Module):
     def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, attn_drop=0.0, proj_drop=0.0,
-                 mixer="attention", pom_degree=3, pom_expand=1, pom_n_groups=1):
+                 mixer="attention", pom_degree=3, pom_expand=1, pom_n_groups=1, pom_hw=16):
         super().__init__()
         self.norm1 = RMSNorm(hidden_size, eps=1e-6)
         if mixer == "pom":
-            self.attn = ComPoMWrapper(hidden_size, num_heads=num_heads, degree=pom_degree,
-                                      expand=pom_expand, n_groups=pom_n_groups)
+            self.attn = PoMRoPE(dim=hidden_size, degree=pom_degree, expand=pom_expand,
+                                n_groups=pom_n_groups, n_sel_heads=num_heads,
+                                rope_2d=True, max_h=pom_hw, max_w=pom_hw)
         else:
             self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, qk_norm=True,
                                   attn_drop=attn_drop, proj_drop=proj_drop)
@@ -223,9 +200,14 @@ class JiTBlock(nn.Module):
             nn.Linear(hidden_size, 6 * hidden_size, bias=True)
         )
 
-    def forward(self, x, c, feat_rope=None):
+    def forward(self, x, c, rope=None, positions_hw=None):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=-1)
-        x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa), rope=feat_rope)
+        x_mod = modulate(self.norm1(x), shift_msa, scale_msa)
+        if positions_hw is not None:
+            attn_out = self.attn(x_mod, positions_hw=positions_hw)
+        else:
+            attn_out = self.attn(x_mod, rope=rope)
+        x = x + gate_msa.unsqueeze(1) * attn_out
         x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
         return x
 
@@ -281,19 +263,33 @@ class JiT(nn.Module):
             self.in_context_posemb = nn.Parameter(torch.zeros(1, self.in_context_len, hidden_size), requires_grad=True)
             torch.nn.init.normal_(self.in_context_posemb, std=.02)
 
-        # rope
-        half_head_dim = hidden_size // num_heads // 2
+        self.mixer = mixer
         hw_seq_len = input_size // patch_size
-        self.feat_rope = VisionRotaryEmbeddingFast(
-            dim=half_head_dim,
-            pt_seq_len=hw_seq_len,
-            num_cls_token=0
-        )
-        self.feat_rope_incontext = VisionRotaryEmbeddingFast(
-            dim=half_head_dim,
-            pt_seq_len=hw_seq_len,
-            num_cls_token=self.in_context_len
-        )
+
+        if mixer == "pom":
+            # Precompute 2D (row, col) patch positions for PoMRoPE.
+            # In-context tokens get position (0, 0) → identity rotation,
+            # matching VisionRotaryEmbeddingFast's cos=1/sin=0 CLS padding.
+            rows = torch.arange(hw_seq_len)
+            cols = torch.arange(hw_seq_len)
+            grid_h, grid_w = torch.meshgrid(rows, cols, indexing="ij")
+            positions = torch.stack([grid_h.flatten(), grid_w.flatten()], dim=-1)  # (N, 2)
+            self.register_buffer("pom_positions", positions, persistent=False)
+            ic_pad = torch.zeros(in_context_len, 2, dtype=torch.long)
+            self.register_buffer("pom_positions_incontext",
+                                 torch.cat([ic_pad, positions], dim=0), persistent=False)
+        else:
+            half_head_dim = hidden_size // num_heads // 2
+            self.feat_rope = VisionRotaryEmbeddingFast(
+                dim=half_head_dim,
+                pt_seq_len=hw_seq_len,
+                num_cls_token=0
+            )
+            self.feat_rope_incontext = VisionRotaryEmbeddingFast(
+                dim=half_head_dim,
+                pt_seq_len=hw_seq_len,
+                num_cls_token=self.in_context_len
+            )
 
         # transformer
         self.blocks = nn.ModuleList([
@@ -301,7 +297,7 @@ class JiT(nn.Module):
                      attn_drop=attn_drop if (depth // 4 * 3 > i >= depth // 4) else 0.0,
                      proj_drop=proj_drop if (depth // 4 * 3 > i >= depth // 4) else 0.0,
                      mixer=mixer, pom_degree=pom_degree, pom_expand=pom_expand,
-                     pom_n_groups=pom_n_groups)
+                     pom_n_groups=pom_n_groups, pom_hw=hw_seq_len)
             for i in range(depth)
         ])
 
@@ -383,7 +379,12 @@ class JiT(nn.Module):
                 in_context_tokens = y_emb.unsqueeze(1).repeat(1, self.in_context_len, 1)
                 in_context_tokens += self.in_context_posemb
                 x = torch.cat([in_context_tokens, x], dim=1)
-            x = block(x, c, self.feat_rope if i < self.in_context_start else self.feat_rope_incontext)
+            if self.mixer == "pom":
+                positions_hw = self.pom_positions if i < self.in_context_start else self.pom_positions_incontext
+                x = block(x, c, positions_hw=positions_hw)
+            else:
+                rope = self.feat_rope if i < self.in_context_start else self.feat_rope_incontext
+                x = block(x, c, rope=rope)
 
         x = x[:, self.in_context_len:]
 
